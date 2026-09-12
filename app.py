@@ -47,6 +47,8 @@ HEAD_MASK_SIDE_SCALE = 1.22
 HEAD_MASK_FOREHEAD_MARGIN = 0.62
 HEAD_MASK_CHIN_MARGIN = 0.08
 GRABCUT_ITERATIONS = 3
+FACE_BLEND_FOREHEAD_MARGIN = 0.30
+FACE_BLEND_FEATHER_RATIO = 0.035
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -118,7 +120,8 @@ def affine_transform(input_image, input_triangle, output_triangle, size):
                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         return output_image
     except:
-        return np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        # 当前处理链使用白色背景，变形失败时也不能产生黑色三角形。
+        return np.full((size[1], size[0], 3), 255, dtype=np.uint8)
 
 def morph_triangle(img_src, img_dst, t_src, t_dst):
     try:
@@ -153,7 +156,8 @@ def morph_triangle(img_src, img_dst, t_src, t_dst):
         return None
 
 def warp_image(img, src_points, dst_points, triangles):
-    warped_img = np.zeros(img.shape, dtype=img.dtype)
+    # 白色初始化可避免三角形取整或反锯齿边缘留下黑色细缝。
+    warped_img = np.full(img.shape, 255, dtype=img.dtype)
     for i in triangles:
         x, y, z = i[0], i[1], i[2]
         t_src = [src_points[x], src_points[y], src_points[z]]
@@ -173,6 +177,65 @@ def warp_image(img, src_points, dst_points, triangles):
         current_slice = warped_img[y1:y2, x1:x2]
         warped_img[y1:y2, x1:x2] = current_slice * (1 - mask_slice) + warp_slice * mask_slice
     return warped_img
+
+
+def create_face_blend_mask(points, image_shape):
+    """创建不包含头发的羽化面部掩膜，避免不同发型被线性叠加。"""
+    h_img, w_img = image_shape[:2]
+    mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    if points is None or len(points) < 68:
+        return mask.astype(np.float32)[:, :, None]
+
+    face_pts = np.asarray(points[:68], dtype=np.float32)
+    jaw = face_pts[0:17]
+    brows = face_pts[17:27]
+
+    jaw_left = float(np.min(jaw[:, 0]))
+    jaw_right = float(np.max(jaw[:, 0]))
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_width = max(1.0, jaw_right - jaw_left)
+    face_height = max(1.0, chin_y - brow_top)
+    center_x = (jaw_left + jaw_right) / 2.0
+    forehead_y = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
+
+    # 下颌点按左→下巴→右排列，再从右侧太阳穴沿额头返回左侧。
+    forehead_points = np.array([
+        [jaw_right, brow_top - 0.08 * face_height],
+        [center_x + 0.32 * face_width, forehead_y],
+        [center_x, forehead_y - 0.04 * face_height],
+        [center_x - 0.32 * face_width, forehead_y],
+        [jaw_left, brow_top - 0.08 * face_height]
+    ], dtype=np.float32)
+    contour = np.vstack([jaw, forehead_points])
+    hull = cv2.convexHull(np.int32(np.round(contour)))
+    cv2.fillConvexPoly(mask, hull, 255, lineType=cv2.LINE_AA)
+
+    feather_size = max(
+        7,
+        int(round(min(h_img, w_img) * FACE_BLEND_FEATHER_RATIO))
+    )
+    if feather_size % 2 == 0:
+        feather_size += 1
+    feather_size = min(feather_size, 51)
+    mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
+    return mask.astype(np.float32)[:, :, None] / 255.0
+
+
+def blend_face_without_hair_ghosting(warp1, warp2, points_avg, alpha):
+    """只融合面部；同组六个比例始终使用数据库模板的头发和轮廓。"""
+    blended_face = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
+
+    # 第二张图是同一组比例共用的数据库模板。固定其外部特征可避免
+    # 黑色半透明双影，也不会在 40% 和 60% 之间突然切换发型。
+    hair_base = warp2
+    face_mask = create_face_blend_mask(points_avg, blended_face.shape)
+    result = (
+        blended_face.astype(np.float32) * face_mask +
+        hair_base.astype(np.float32) * (1.0 - face_mask)
+    )
+    return np.clip(result, 0, 255).astype(np.uint8)
+
 
 def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
     try:
@@ -194,7 +257,12 @@ def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
         triangles = get_triangles(points_avg)
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
-        final_img = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
+        final_img = blend_face_without_hair_ghosting(
+            warp1,
+            warp2,
+            points_avg,
+            alpha
+        )
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
