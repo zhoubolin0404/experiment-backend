@@ -43,12 +43,7 @@ MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 FACE_CROP_SIDE_MARGIN = 0.04
 FACE_CROP_FOREHEAD_MARGIN = 0.42
 FACE_CROP_CHIN_MARGIN = 0.05
-HEAD_MASK_SIDE_SCALE = 1.22
-HEAD_MASK_FOREHEAD_MARGIN = 0.62
-HEAD_MASK_CHIN_MARGIN = 0.08
-GRABCUT_ITERATIONS = 3
-FACE_BLEND_FOREHEAD_MARGIN = 0.30
-FACE_BLEND_FEATHER_RATIO = 0.035
+FACE_BLEND_FEATHER_RATIO = 0.025
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -120,8 +115,12 @@ def affine_transform(input_image, input_triangle, output_triangle, size):
                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         return output_image
     except:
-        # 当前处理链使用白色背景，变形失败时也不能产生黑色三角形。
-        return np.full((size[1], size[0], 3), 255, dtype=np.uint8)
+        # 使用当前图像块填补失败区域，避免出现黑色或白色三角形。
+        return cv2.resize(
+            input_image,
+            (size[0], size[1]),
+            interpolation=cv2.INTER_LINEAR
+        )
 
 def morph_triangle(img_src, img_dst, t_src, t_dst):
     try:
@@ -156,8 +155,8 @@ def morph_triangle(img_src, img_dst, t_src, t_dst):
         return None
 
 def warp_image(img, src_points, dst_points, triangles):
-    # 白色初始化可避免三角形取整或反锯齿边缘留下黑色细缝。
-    warped_img = np.full(img.shape, 255, dtype=img.dtype)
+    # 以原图初始化，三角形取整产生的极小空隙会保留原始底图颜色。
+    warped_img = np.copy(img)
     for i in triangles:
         x, y, z = i[0], i[1], i[2]
         t_src = [src_points[x], src_points[y], src_points[z]]
@@ -180,35 +179,16 @@ def warp_image(img, src_points, dst_points, triangles):
 
 
 def create_face_blend_mask(points, image_shape):
-    """创建不包含头发的羽化面部掩膜，避免不同发型被线性叠加。"""
+    """创建仅覆盖内部面孔、不进入头发区域的羽化掩膜。"""
     h_img, w_img = image_shape[:2]
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     if points is None or len(points) < 68:
         return mask.astype(np.float32)[:, :, None]
 
     face_pts = np.asarray(points[:68], dtype=np.float32)
-    jaw = face_pts[0:17]
-    brows = face_pts[17:27]
-
-    jaw_left = float(np.min(jaw[:, 0]))
-    jaw_right = float(np.max(jaw[:, 0]))
-    brow_top = float(np.min(brows[:, 1]))
-    chin_y = float(np.max(jaw[:, 1]))
-    face_width = max(1.0, jaw_right - jaw_left)
-    face_height = max(1.0, chin_y - brow_top)
-    center_x = (jaw_left + jaw_right) / 2.0
-    forehead_y = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
-
-    # 下颌点按左→下巴→右排列，再从右侧太阳穴沿额头返回左侧。
-    forehead_points = np.array([
-        [jaw_right, brow_top - 0.08 * face_height],
-        [center_x + 0.32 * face_width, forehead_y],
-        [center_x, forehead_y - 0.04 * face_height],
-        [center_x - 0.32 * face_width, forehead_y],
-        [jaw_left, brow_top - 0.08 * face_height]
-    ], dtype=np.float32)
-    contour = np.vstack([jaw, forehead_points])
-    hull = cv2.convexHull(np.int32(np.round(contour)))
+    # 68 点的凸包上边界止于眉毛、下边界止于下颌，不再构造额头点。
+    # 因此头发、耳朵和背景始终位于融合掩膜之外。
+    hull = cv2.convexHull(np.int32(np.round(face_pts)))
     cv2.fillConvexPoly(mask, hull, 255, lineType=cv2.LINE_AA)
 
     feather_size = max(
@@ -223,11 +203,11 @@ def create_face_blend_mask(points, image_shape):
 
 
 def blend_face_without_hair_ghosting(warp1, warp2, points_avg, alpha):
-    """只融合面部；同组六个比例始终使用数据库模板的头发和轮廓。"""
+    """数据库图作为完整底图，仅在内部面部掩膜中融合五官。"""
     blended_face = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
 
-    # 第二张图是同一组比例共用的数据库模板。固定其外部特征可避免
-    # 黑色半透明双影，也不会在 40% 和 60% 之间突然切换发型。
+    # 第二张图是同一组比例共用的数据库模板。其头发、背景和外轮廓
+    # 完整保留，只有掩膜内部的眼鼻口及面部区域随比例变化。
     hair_base = warp2
     face_mask = create_face_blend_mask(points_avg, blended_face.shape)
     result = (
@@ -252,7 +232,8 @@ def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
             points2 = get_points(img2)
 
         if len(points1) < 68 or len(points2) < 68 or len(points1) != len(points2):
-            return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
+            # 无法可靠定位五官时保留数据库模板，禁止退化为整图透明叠加。
+            return img2, None
         points_avg = (1 - alpha) * np.array(points1) + alpha * np.array(points2)
         triangles = get_triangles(points_avg)
         warp1 = warp_image(img1, points1, points_avg, triangles)
@@ -266,9 +247,8 @@ def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
-        s1 = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
         s2 = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        return cv2.addWeighted(s1, 1-alpha, s2, alpha, 0), None
+        return s2, None
 
 def crop_face_region(image, landmarks, output_width, output_height):
     """按面部关键点标准化裁剪，只保留头部并在下巴下方留下极小余量。"""
@@ -342,111 +322,6 @@ def crop_face_region(image, landmarks, output_width, output_height):
         return cv2.resize(image, (output_width, output_height))
 
 
-def replace_background_with_white(image, landmarks):
-    """使用关键点约束的 GrabCut 提取头部，将其余背景替换为纯白色。"""
-    if image is None:
-        return None
-    if landmarks is None or len(landmarks) < 68:
-        return image
-
-    try:
-        face_pts = np.asarray(landmarks[:68], dtype=np.float32)
-        jaw = face_pts[0:17]
-        brows = face_pts[17:27]
-
-        jaw_left = float(np.min(jaw[:, 0]))
-        jaw_right = float(np.max(jaw[:, 0]))
-        brow_top = float(np.min(brows[:, 1]))
-        chin_y = float(np.max(jaw[:, 1]))
-        face_width = jaw_right - jaw_left
-        face_height = chin_y - brow_top
-        if face_width <= 1 or face_height <= 1:
-            return image
-
-        h_img, w_img = image.shape[:2]
-        center_x = int(round((jaw_left + jaw_right) / 2.0))
-        head_top = brow_top - HEAD_MASK_FOREHEAD_MARGIN * face_height
-        head_bottom = chin_y + HEAD_MASK_CHIN_MARGIN * face_height
-        center_y = int(round((head_top + head_bottom) / 2.0))
-        radius_x = max(2, int(round(face_width * HEAD_MASK_SIDE_SCALE / 2.0)))
-        radius_y = max(2, int(round((head_bottom - head_top) / 2.0)))
-
-        # 几何头部区域用于限制 GrabCut，确保颈部和肩部不会被当作前景保留。
-        head_mask = np.zeros((h_img, w_img), dtype=np.uint8)
-        cv2.ellipse(
-            head_mask,
-            (center_x, center_y),
-            (radius_x, radius_y),
-            0,
-            0,
-            360,
-            255,
-            -1,
-            lineType=cv2.LINE_AA
-        )
-
-        grabcut_mask = np.full((h_img, w_img), cv2.GC_BGD, dtype=np.uint8)
-        grabcut_mask[head_mask > 0] = cv2.GC_PR_FGD
-
-        face_hull = cv2.convexHull(np.int32(face_pts))
-        cv2.fillConvexPoly(grabcut_mask, face_hull, cv2.GC_FGD)
-
-        bg_model = np.zeros((1, 65), dtype=np.float64)
-        fg_model = np.zeros((1, 65), dtype=np.float64)
-        try:
-            cv2.grabCut(
-                image,
-                grabcut_mask,
-                None,
-                bg_model,
-                fg_model,
-                GRABCUT_ITERATIONS,
-                cv2.GC_INIT_WITH_MASK
-            )
-            foreground_mask = np.where(
-                (grabcut_mask == cv2.GC_FGD) |
-                (grabcut_mask == cv2.GC_PR_FGD),
-                255,
-                0
-            ).astype(np.uint8)
-            foreground_mask = cv2.bitwise_and(foreground_mask, head_mask)
-            # GrabCut 不得误删眼睛、鼻子、嘴和下颌内部的核心面部区域。
-            cv2.fillConvexPoly(foreground_mask, face_hull, 255)
-        except cv2.error as e:
-            print(f"GrabCut fallback to geometric head mask: {e}")
-            foreground_mask = head_mask
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        foreground_mask = cv2.morphologyEx(
-            foreground_mask,
-            cv2.MORPH_CLOSE,
-            kernel,
-            iterations=2
-        )
-
-        # 羽化轮廓，减少头发边缘与纯白背景之间的锯齿。
-        feather_size = max(5, int(round(min(h_img, w_img) * 0.015)))
-        if feather_size % 2 == 0:
-            feather_size += 1
-        feather_size = min(feather_size, 31)
-        foreground_mask = cv2.GaussianBlur(
-            foreground_mask,
-            (feather_size, feather_size),
-            0
-        )
-
-        alpha_mask = foreground_mask.astype(np.float32)[:, :, None] / 255.0
-        white_background = np.full_like(image, 255)
-        result = (
-            image.astype(np.float32) * alpha_mask +
-            white_background.astype(np.float32) * (1.0 - alpha_mask)
-        )
-        return np.clip(result, 0, 255).astype(np.uint8)
-    except Exception as e:
-        print(f"Error in replace_background_with_white: {e}")
-        return image
-
-
 # --- 融合结果紧裁剪：保留面孔和头部，不保留肩部 ---
 def crop_face_tight(image, landmarks):
     return crop_face_region(image, landmarks, OUTPUT_WIDTH, OUTPUT_HEIGHT)
@@ -458,7 +333,6 @@ def crop_portrait_wide(image):
         points = get_points(image)
         if len(points) < 68:
             return cv2.resize(image, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        image = replace_background_with_white(image, points)
         return crop_face_region(
             image,
             points,
