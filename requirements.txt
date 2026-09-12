@@ -1,0 +1,12 @@
+flask
+flask-cors
+numpy<2
+scipy
+opencv-python-headless
+gunicorn
+waitress
+requests
+cmake
+dlib-bin
+pandas
+openpyxl

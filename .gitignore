@@ -1,0 +1,31 @@
+# Python runtime and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets and service configuration
+.env
+.env.*
+ngrok.yml
+*.log
+
+# Participant data and experiment results must never be published
+participant_faces/
+data/
+
+# Licensed/runtime image assets are provisioned on the deployment machine
+database/
+AMFD Faces Final/
+shape_predictor_68_face_landmarks.dat
+
+# Large local source archives and research workbooks
+*.zip
+*.xlsx
+*.xls
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
