@@ -44,6 +44,9 @@ FACE_CROP_SIDE_MARGIN = 0.04
 FACE_CROP_FOREHEAD_MARGIN = 0.42
 FACE_CROP_CHIN_MARGIN = 0.05
 FACE_BLEND_FEATHER_RATIO = 0.025
+FACE_BLEND_SAFE_FOREHEAD_MARGIN = 0.18
+FACE_BLEND_MAX_FOREHEAD_MARGIN = 0.55
+FACE_SKIN_COLOR_DISTANCE = 48.0
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -178,18 +181,126 @@ def warp_image(img, src_points, dst_points, triangles):
     return warped_img
 
 
-def create_face_blend_mask(points, image_shape):
-    """创建仅覆盖内部面孔、不进入头发区域的羽化掩膜。"""
+def estimate_skin_mask(image, face_pts):
+    """根据两颊和眉间的实际颜色，自适应识别当前人脸的皮肤区域。"""
+    h_img, w_img = image.shape[:2]
+    jaw = face_pts[0:17]
+    face_width = max(1.0, float(np.max(jaw[:, 0]) - np.min(jaw[:, 0])))
+    face_height = max(
+        1.0,
+        float(np.max(jaw[:, 1]) - np.min(face_pts[17:27, 1]))
+    )
+
+    sample_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    sample_radius = max(3, int(round(face_width * 0.045)))
+    sample_centers = [
+        0.52 * face_pts[31] + 0.48 * face_pts[3],
+        0.52 * face_pts[35] + 0.48 * face_pts[13],
+        face_pts[27] + np.array([0.0, -0.10 * face_height], dtype=np.float32)
+    ]
+    for center in sample_centers:
+        cv2.circle(
+            sample_mask,
+            tuple(np.int32(np.round(center))),
+            sample_radius,
+            255,
+            -1,
+            lineType=cv2.LINE_AA
+        )
+
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    samples = lab_image[sample_mask > 0]
+    if samples.size == 0:
+        return np.zeros((h_img, w_img), dtype=np.uint8)
+
+    median_skin = np.median(samples, axis=0)
+    color_distance = np.linalg.norm(lab_image - median_skin, axis=2)
+    skin_mask = np.where(
+        color_distance <= FACE_SKIN_COLOR_DISTANCE,
+        255,
+        0
+    ).astype(np.uint8)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+    skin_mask = cv2.morphologyEx(
+        skin_mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+    return skin_mask
+
+
+def create_face_blend_mask(points, image1, image2):
+    """融合完整面部皮肤和五官，同时用肤色判断避开头发。"""
+    image_shape = image1.shape
     h_img, w_img = image_shape[:2]
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     if points is None or len(points) < 68:
         return mask.astype(np.float32)[:, :, None]
 
     face_pts = np.asarray(points[:68], dtype=np.float32)
-    # 68 点的凸包上边界止于眉毛、下边界止于下颌，不再构造额头点。
-    # 因此头发、耳朵和背景始终位于融合掩膜之外。
-    hull = cv2.convexHull(np.int32(np.round(face_pts)))
-    cv2.fillConvexPoly(mask, hull, 255, lineType=cv2.LINE_AA)
+    jaw = face_pts[0:17]
+    brows = face_pts[17:27]
+    jaw_left = float(np.min(jaw[:, 0]))
+    jaw_right = float(np.max(jaw[:, 0]))
+    brow_left = float(np.min(brows[:, 0]))
+    brow_right = float(np.max(brows[:, 0]))
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_width = max(1.0, jaw_right - jaw_left)
+    face_height = max(1.0, chin_y - brow_top)
+    center_x = (jaw_left + jaw_right) / 2.0
+
+    # 必融合区：68点凸包以及眉毛上方一小段确定为额头的安全皮肤区域。
+    core_hull = cv2.convexHull(np.int32(np.round(face_pts)))
+    cv2.fillConvexPoly(mask, core_hull, 255, lineType=cv2.LINE_AA)
+    safe_top = brow_top - FACE_BLEND_SAFE_FOREHEAD_MARGIN * face_height
+    safe_forehead_points = np.array([
+        [brow_left, brow_top],
+        [center_x - 0.34 * face_width, safe_top],
+        [center_x, safe_top - 0.02 * face_height],
+        [center_x + 0.34 * face_width, safe_top],
+        [brow_right, brow_top]
+    ], dtype=np.float32)
+    safe_forehead_hull = cv2.convexHull(
+        np.int32(np.round(np.vstack([brows, safe_forehead_points])))
+    )
+    cv2.fillConvexPoly(mask, safe_forehead_hull, 255, lineType=cv2.LINE_AA)
+
+    # 可扩展区覆盖到可能的发际线；其中只有两张图都属于皮肤的像素才融合。
+    max_top = brow_top - FACE_BLEND_MAX_FOREHEAD_MARGIN * face_height
+    extended_points = np.array([
+        [brow_left - 0.04 * face_width, brow_top],
+        [center_x - 0.40 * face_width, max_top + 0.06 * face_height],
+        [center_x, max_top],
+        [center_x + 0.40 * face_width, max_top + 0.06 * face_height],
+        [brow_right + 0.04 * face_width, brow_top]
+    ], dtype=np.float32)
+    forehead_region = np.zeros((h_img, w_img), dtype=np.uint8)
+    extended_hull = cv2.convexHull(
+        np.int32(np.round(np.vstack([brows, extended_points])))
+    )
+    cv2.fillConvexPoly(
+        forehead_region,
+        extended_hull,
+        255,
+        lineType=cv2.LINE_AA
+    )
+
+    skin1 = estimate_skin_mask(image1, face_pts)
+    skin2 = estimate_skin_mask(image2, face_pts)
+    shared_forehead_skin = cv2.bitwise_and(skin1, skin2)
+    shared_forehead_skin = cv2.bitwise_and(
+        shared_forehead_skin,
+        forehead_region
+    )
+    mask = cv2.bitwise_or(mask, shared_forehead_skin)
+
+    # 连接肤色识别产生的小间隙，避免额头出现斑驳边缘。
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
 
     feather_size = max(
         7,
@@ -209,7 +320,7 @@ def blend_face_without_hair_ghosting(warp1, warp2, points_avg, alpha):
     # 第二张图是同一组比例共用的数据库模板。其头发、背景和外轮廓
     # 完整保留，只有掩膜内部的眼鼻口及面部区域随比例变化。
     hair_base = warp2
-    face_mask = create_face_blend_mask(points_avg, blended_face.shape)
+    face_mask = create_face_blend_mask(points_avg, warp1, warp2)
     result = (
         blended_face.astype(np.float32) * face_mask +
         hair_base.astype(np.float32) * (1.0 - face_mask)
