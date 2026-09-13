@@ -46,11 +46,28 @@ FACE_CROP_CHIN_MARGIN = 0.05
 FACE_BLEND_FOREHEAD_MARGIN = 0.20
 FACE_HAIRLINE_MAX_MARGIN = 0.60
 FACE_HAIRLINE_MIN_MARGIN = 0.04
-FACE_MASK_INNER_FEATHER_RATIO = 0.045
+FACE_MASK_INNER_FEATHER_RATIO = 0.11
+FACE_FOREHEAD_POINT_START = 68
+FACE_FOREHEAD_POINT_COUNT = 17
+FACE_FOREHEAD_INTERIOR_ROWS = 2
+FACE_FOREHEAD_MESH_POINT_COUNT = (
+    FACE_FOREHEAD_POINT_COUNT * (1 + FACE_FOREHEAD_INTERIOR_ROWS)
+)
+FACE_BOUNDARY_POINT_START = (
+    FACE_FOREHEAD_POINT_START + FACE_FOREHEAD_MESH_POINT_COUNT
+)
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
 FACE_ALIGN_RIGHT_EYE = (0.66, 0.40)
 FACE_ALIGN_MOUTH = (0.50, 0.69)
-FACE_BLEND_PYRAMID_LEVELS = 4
+DATABASE_EXCLUDED_FILENAMES = {
+    # 镜框跨越融合边界会形成断裂伪影，不作为随机 morph 素材。
+    'nm-1010.jpg',
+    'nf-1006.jpg',
+    'nf-1021.jpg',
+    'nf-1040.jpg',
+    'nf-1077.jpg',
+    'nf-1103.jpg'
+}
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -67,9 +84,9 @@ predictor = None
 try:
     detector = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor(PREDICTOR_PATH)
-    print("✅ Dlib 模型加载成功 (Dlib models loaded successfully).")
+    print("[OK] Dlib models loaded successfully.")
 except Exception as e:
-    print(f"❌ 警告: Dlib 模型加载失败。请确保 '{PREDICTOR_PATH}' 文件存在。")
+    print(f"[ERROR] Dlib model could not be loaded from '{PREDICTOR_PATH}'.")
     print(e)
 
 # --- 核心图像处理函数 ---
@@ -232,10 +249,19 @@ def build_face_contour_mask(points, image_shape, forehead_points=None):
 
     if forehead_points is None:
         # 仅作为检测失败时的保守回退；不会向上猜到通常的发际线位置。
-        x_fractions = np.linspace(0.04, 0.96, 9, dtype=np.float32)
-        arc_offsets = np.array(
-            [0.12, 0.07, 0.03, 0.01, 0.0, 0.01, 0.03, 0.07, 0.12],
+        x_fractions = np.linspace(
+            0.05,
+            0.95,
+            FACE_FOREHEAD_POINT_COUNT,
             dtype=np.float32
+        )
+        arc_offsets = (
+            0.12 * np.abs(np.linspace(
+                -1.0,
+                1.0,
+                FACE_FOREHEAD_POINT_COUNT,
+                dtype=np.float32
+            )) ** 1.7
         )
         forehead_top = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
         forehead_points = np.column_stack([
@@ -259,7 +285,7 @@ def build_face_contour_mask(points, image_shape, forehead_points=None):
 
 
 def estimate_visible_forehead_points(image, points):
-    """用人脸内部种子引导 GrabCut，估计当前照片实际可见的连续额头上缘。"""
+    """学习当前人脸肤色，并从眉上皮肤向上追踪实际可见发际线。"""
     if image is None or points is None or len(points) < 68:
         return None
 
@@ -274,7 +300,12 @@ def estimate_visible_forehead_points(image, points):
     face_height = max(1.0, chin_y - brow_top)
     h_img, w_img = image.shape[:2]
 
-    x_fractions = np.linspace(0.04, 0.96, 9, dtype=np.float32)
+    x_fractions = np.linspace(
+        0.05,
+        0.95,
+        FACE_FOREHEAD_POINT_COUNT,
+        dtype=np.float32
+    )
     sample_x = jaw_left + x_fractions * face_width
     min_y = max(0, int(round(
         brow_top - FACE_HAIRLINE_MAX_MARGIN * face_height
@@ -282,18 +313,68 @@ def estimate_visible_forehead_points(image, points):
     max_y = min(h_img - 1, int(round(brow_top + 0.12 * face_height)))
     minimum_visible_y = brow_top - FACE_HAIRLINE_MIN_MARGIN * face_height
     fallback_top = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
-    fallback_offsets = np.array(
-        [0.12, 0.07, 0.03, 0.01, 0.0, 0.01, 0.03, 0.07, 0.12],
+    normalized_x = np.linspace(
+        -1.0,
+        1.0,
+        FACE_FOREHEAD_POINT_COUNT,
         dtype=np.float32
-    ) * face_height
+    )
+    fallback_offsets = 0.12 * np.abs(normalized_x) ** 1.7 * face_height
     detected_y = fallback_top + fallback_offsets
 
     try:
+        # 样本全部来自当前照片的两颊和鼻梁；肤色深浅、人种与白平衡不会
+        # 使用全局固定阈值。仅在此处判断上边界，不对面孔内部逐像素挖洞。
+        sample_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        seed_radius = max(4, int(round(face_width * 0.035)))
+        seed_centers = [
+            0.58 * face_pts[31] + 0.42 * face_pts[3],
+            0.58 * face_pts[35] + 0.42 * face_pts[13],
+            face_pts[27] + np.array([0.0, 0.05 * face_height], dtype=np.float32),
+            face_pts[29],
+            0.55 * face_pts[41] + 0.45 * face_pts[31],
+            0.55 * face_pts[46] + 0.45 * face_pts[35]
+        ]
+        for center in seed_centers:
+            cv2.circle(
+                sample_mask,
+                tuple(np.int32(np.round(center))),
+                seed_radius,
+                255,
+                -1,
+                lineType=cv2.LINE_AA
+            )
+
+        smoothed_image = cv2.GaussianBlur(image, (5, 5), 0)
+        lab_image = cv2.cvtColor(
+            smoothed_image,
+            cv2.COLOR_BGR2LAB
+        ).astype(np.float32)
+        samples = lab_image[sample_mask > 0]
+        if samples.size == 0:
+            return np.column_stack([sample_x, detected_y]).astype(np.float32)
+
+        skin_center = np.median(samples, axis=0)
+        absolute_deviation = np.abs(samples - skin_center)
+        skin_scale = np.percentile(absolute_deviation, 80, axis=0) * 1.8
+        skin_scale = np.clip(
+            skin_scale,
+            np.array([12.0, 5.0, 5.0], dtype=np.float32),
+            np.array([30.0, 14.0, 14.0], dtype=np.float32)
+        )
+        normalized_delta = (lab_image - skin_center) / skin_scale
+        # 亮度参与但权重略低，避免额头受光与两颊阴影造成误切。
+        skin_distance = np.sqrt(
+            0.70 * normalized_delta[:, :, 0] ** 2 +
+            normalized_delta[:, :, 1] ** 2 +
+            normalized_delta[:, :, 2] ** 2
+        )
+        skin_region = np.where(skin_distance <= 2.65, 255, 0).astype(np.uint8)
+
         candidate_top = brow_top - FACE_HAIRLINE_MAX_MARGIN * face_height
-        candidate_offsets = np.array(
-            [0.18, 0.10, 0.05, 0.02, 0.0, 0.02, 0.05, 0.10, 0.18],
-            dtype=np.float32
-        ) * face_height
+        candidate_offsets = (
+            0.18 * np.abs(normalized_x) ** 1.7 * face_height
+        )
         candidate_forehead = np.column_stack([
             sample_x,
             candidate_top + candidate_offsets
@@ -303,106 +384,135 @@ def estimate_visible_forehead_points(image, points):
             image.shape,
             candidate_forehead
         )
-
-        grabcut_mask = np.full(
-            (h_img, w_img),
-            cv2.GC_BGD,
-            dtype=np.uint8
-        )
-        grabcut_mask[candidate_mask > 0] = cv2.GC_PR_FGD
-
-        sure_face = np.zeros((h_img, w_img), dtype=np.uint8)
-        seed_radius = max(4, int(round(face_width * 0.035)))
-        seed_centers = [
-            0.58 * face_pts[31] + 0.42 * face_pts[3],
-            0.58 * face_pts[35] + 0.42 * face_pts[13],
-            face_pts[27] + np.array([0.0, 0.04 * face_height], dtype=np.float32),
-            face_pts[30]
-        ]
-        for center in seed_centers:
-            cv2.circle(
-                sure_face,
-                tuple(np.int32(np.round(center))),
-                seed_radius,
-                255,
-                -1,
-                lineType=cv2.LINE_AA
-            )
-        grabcut_mask[sure_face > 0] = cv2.GC_FGD
-
-        background_model = np.zeros((1, 65), dtype=np.float64)
-        foreground_model = np.zeros((1, 65), dtype=np.float64)
-        cv2.grabCut(
-            image,
-            grabcut_mask,
-            None,
-            background_model,
-            foreground_model,
-            5,
-            cv2.GC_INIT_WITH_MASK
-        )
-        segmented = np.where(
-            (grabcut_mask == cv2.GC_FGD) |
-            (grabcut_mask == cv2.GC_PR_FGD),
-            255,
-            0
-        ).astype(np.uint8)
-        segmented = cv2.bitwise_and(segmented, candidate_mask)
-        segmented = cv2.morphologyEx(
-            segmented,
+        skin_region = cv2.bitwise_and(skin_region, candidate_mask)
+        skin_region[sample_mask > 0] = 255
+        skin_region = cv2.morphologyEx(
+            skin_region,
             cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
             iterations=2
         )
+        skin_region = cv2.morphologyEx(
+            skin_region,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1
+        )
 
-        # 只保留与确定面部种子重叠最多的连通区域，排除独立的头发和背景块。
         count, labels, _, _ = cv2.connectedComponentsWithStats(
-            (segmented > 0).astype(np.uint8),
+            (skin_region > 0).astype(np.uint8),
             connectivity=8
         )
         best_label = 0
         best_overlap = 0
         for label in range(1, count):
             overlap = int(np.count_nonzero(
-                (labels == label) & (sure_face > 0)
+                (labels == label) & (sample_mask > 0)
             ))
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_label = label
         if best_label == 0:
-            return np.column_stack([sample_x, detected_y])
-        visible_component = np.where(labels == best_label, 255, 0).astype(np.uint8)
+            return np.column_stack([sample_x, detected_y]).astype(np.float32)
+        visible_skin = labels == best_label
 
-        window_radius = max(2, int(round(face_width * 0.015)))
+        window_radius = max(2, int(round(face_width * 0.018)))
+        required_connection_y = int(round(
+            brow_top - 0.02 * face_height
+        ))
         for index, x_value in enumerate(sample_x):
             x_center = int(round(x_value))
             x1 = max(0, x_center - window_radius)
             x2 = min(w_img, x_center + window_radius + 1)
             if x1 >= x2 or min_y >= max_y:
                 continue
+
             profile = np.mean(
-                visible_component[min_y:max_y + 1, x1:x2] > 0,
+                visible_skin[min_y:max_y + 1, x1:x2],
                 axis=1
-            ) >= 0.35
+            ) >= 0.32
             profile = cv2.morphologyEx(
                 (profile.astype(np.uint8) * 255)[:, None],
                 cv2.MORPH_CLOSE,
-                np.ones((9, 1), dtype=np.uint8)
+                np.ones((13, 1), dtype=np.uint8)
             )[:, 0] > 0
-            visible_rows = np.flatnonzero(profile)
-            if visible_rows.size:
-                # 小分位数比直接取最顶像素更能抵抗少量误分类噪声。
-                top_index = int(np.quantile(visible_rows, 0.04))
-                detected_y[index] = float(min_y + top_index)
 
-        # 对发际线做短范围中值平滑，同时保留中央刘海形成的真实凹口。
-        smoothed_y = detected_y.copy()
-        for index in range(len(detected_y)):
-            left = max(0, index - 1)
-            right = min(len(detected_y), index + 2)
-            smoothed_y[index] = float(np.median(detected_y[left:right]))
+            padded = np.pad(profile.astype(np.int8), (1, 1))
+            changes = np.diff(padded)
+            run_starts = np.flatnonzero(changes == 1)
+            run_ends = np.flatnonzero(changes == -1) - 1
+            connected_runs = [
+                (start, end)
+                for start, end in zip(run_starts, run_ends)
+                if min_y + end >= required_connection_y
+            ]
+            if connected_runs:
+                start, _ = max(connected_runs, key=lambda run: run[1])
+                # 在分类边界内再收缩少量，避免抗锯齿发丝进入皮肤三角形。
+                detected_y[index] = float(
+                    min_y + start + max(2, int(round(0.012 * face_height)))
+                )
+
+        # 先做短范围平滑，再拟合低阶曲线。单根发丝、反光或局部阴影
+        # 不应成为 Delaunay 控制点，否则会被放大成截图中的三角楔形。
+        smoothing_kernel = np.array(
+            [1.0, 2.0, 3.0, 2.0, 1.0],
+            dtype=np.float32
+        ) / 9.0
+        smoothed_y = np.convolve(
+            np.pad(detected_y, (2, 2), mode='edge'),
+            smoothing_kernel,
+            mode='valid'
+        )
+        central_mask = np.abs(normalized_x) <= 0.46
+        fit_mask = central_mask.copy()
+        fitted_y = smoothed_y.copy()
+        for _ in range(3):
+            if np.count_nonzero(fit_mask) < 5:
+                break
+            coefficients = np.polyfit(
+                normalized_x[fit_mask],
+                smoothed_y[fit_mask],
+                deg=2
+            )
+            fitted_y = np.polyval(coefficients, normalized_x)
+            residual = smoothed_y - fitted_y
+            median_residual = float(np.median(residual[fit_mask]))
+            mad = float(np.median(np.abs(
+                residual[fit_mask] - median_residual
+            )))
+            tolerance = max(0.035 * face_height, 2.8 * mad)
+            next_fit_mask = central_mask & (
+                np.abs(residual - median_residual) <= tolerance
+            )
+            if np.array_equal(next_fit_mask, fit_mask):
+                break
+            fit_mask = next_fit_mask
+
+        # 向脸内移动至大多数观测点下方；宁可少融几像素额头，也不混入头发。
+        central_residual = (smoothed_y - fitted_y)[central_mask]
+        inward_shift = max(
+            0.0,
+            float(np.quantile(central_residual, 0.85))
+        ) + 0.012 * face_height
+        fitted_y = fitted_y + inward_shift
+
+        # 中央区域确定额头高度，外侧平滑下降到太阳穴，避免两侧短发
+        # 把整个额头曲线拖到眉毛上方。
+        temple_blend = np.clip(
+            (np.abs(normalized_x) - 0.46) / 0.54,
+            0.0,
+            1.0
+        )
+        temple_blend = (
+            temple_blend * temple_blend * (3.0 - 2.0 * temple_blend)
+        )
+        fitted_y = (
+            fitted_y * (1.0 - temple_blend) +
+            minimum_visible_y * temple_blend
+        )
         detected_y = np.clip(
-            smoothed_y,
+            fitted_y,
             min_y,
             minimum_visible_y
         )
@@ -420,9 +530,45 @@ def create_visible_face_mask(image, points, forehead_points=None):
     # 向内收一小圈，边缘稍后用距离变换在脸内完成渐变。
     return cv2.erode(
         mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
         iterations=1
     )
+
+
+def build_forehead_mesh_points(points, hairline_points):
+    """在发际线与眉毛之间补两排控制点，避免大三角形造成额头色块。"""
+    face_pts = np.asarray(points[:68], dtype=np.float32)
+    hairline = np.asarray(hairline_points, dtype=np.float32)
+    brows = face_pts[17:27]
+    jaw = face_pts[0:17]
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_height = max(1.0, chin_y - brow_top)
+
+    brow_order = np.argsort(brows[:, 0])
+    brow_x = brows[brow_order, 0]
+    brow_y = brows[brow_order, 1]
+    lower_y = np.interp(
+        hairline[:, 0],
+        brow_x,
+        brow_y,
+        left=float(brow_y[0]),
+        right=float(brow_y[-1])
+    ).astype(np.float32) - 0.035 * face_height
+    # 太阳穴处发际线可能接近眉毛，仍需保持最小网格高度以避免重复点。
+    lower_y = np.maximum(
+        lower_y,
+        hairline[:, 1] + 0.055 * face_height
+    )
+    lower_forehead = np.column_stack([hairline[:, 0], lower_y])
+
+    mesh_rows = [hairline]
+    for row_index in range(1, FACE_FOREHEAD_INTERIOR_ROWS + 1):
+        fraction = row_index / float(FACE_FOREHEAD_INTERIOR_ROWS + 1)
+        mesh_rows.append(
+            (1.0 - fraction) * hairline + fraction * lower_forehead
+        )
+    return np.vstack(mesh_rows).astype(np.float32)
 
 
 def prepare_face_geometry(image, points):
@@ -431,7 +577,10 @@ def prepare_face_geometry(image, points):
         return np.array([]), None
 
     forehead_points = estimate_visible_forehead_points(image, points)
-    if forehead_points is None or len(forehead_points) != 9:
+    if (
+        forehead_points is None or
+        len(forehead_points) != FACE_FOREHEAD_POINT_COUNT
+    ):
         return np.array([]), None
 
     h_img, w_img = image.shape[:2]
@@ -442,9 +591,13 @@ def prepare_face_geometry(image, points):
         [x_max, y_max // 2], [x_max, y_max], [x_max // 2, y_max],
         [0, y_max], [0, y_max // 2]
     ])
+    forehead_mesh_points = build_forehead_mesh_points(
+        points,
+        forehead_points
+    )
     geometry_points = np.vstack([
         np.asarray(points[:68], dtype=np.float32),
-        np.asarray(forehead_points, dtype=np.float32),
+        forehead_mesh_points,
         boundary_points
     ])
     visible_mask = create_visible_face_mask(
@@ -455,14 +608,22 @@ def prepare_face_geometry(image, points):
     return geometry_points, visible_mask
 
 
-def create_shared_face_blend_mask(mask1, mask2, points, image_shape):
-    """取两张照片可见面部的连续交集，并生成不会越过发际线的内向羽化。"""
+def create_shared_face_blend_mask(
+    mask1,
+    mask2,
+    points,
+    image_shape,
+    base_face_mask=None
+):
+    """以数据库可见面部为覆盖范围，并生成严格位于皮肤内的羽化。"""
     h_img, w_img = image_shape[:2]
-    if mask1 is None or mask2 is None:
+    if mask2 is None:
         hard_mask = build_face_contour_mask(points, image_shape)
     else:
+        hard_mask = np.where(mask2 > 127, 255, 0).astype(np.uint8)
+    if base_face_mask is not None:
         hard_mask = np.where(
-            (mask1 > 127) & (mask2 > 127),
+            (hard_mask > 0) & (base_face_mask > 127),
             255,
             0
         ).astype(np.uint8)
@@ -493,83 +654,184 @@ def create_shared_face_blend_mask(mask1, mask2, points, image_shape):
     return soft_mask.astype(np.float32)[:, :, None]
 
 
-def harmonize_transition_tone(face_image, base_image, face_mask):
-    """只协调掩膜边缘的低频色调，保留面部中心真实肤色和五官细节。"""
-    face = face_image.astype(np.float32)
-    base = base_image.astype(np.float32)
+def create_source_texture_confidence(
+    mask,
+    image_shape,
+    target_face_mask=None
+):
+    """让被试纹理从目标面孔边界均匀渐入，避免额头压缩产生尖峰。"""
+    h_img, w_img = image_shape[:2]
+    confidence_mask = target_face_mask if target_face_mask is not None else mask
+    if confidence_mask is None:
+        return np.zeros((h_img, w_img, 1), dtype=np.float32)
+
+    # 被试的可见面孔掩膜经过“高额头 -> 短额头”的强压缩后，内缩边界会
+    # 变成细长尖峰。用它计算距离会令肤色沿尖峰进入额头。目标照片的面孔
+    # 边界才是输出空间中的真实发际线，因此渐入距离必须由目标边界决定。
+    hard_mask = np.where(confidence_mask > 127, 255, 0).astype(np.uint8)
+    hard_mask = cv2.morphologyEx(
+        hard_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1
+    )
+    contours, _ = cv2.findContours(
+        hard_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    solid_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    if contours:
+        cv2.drawContours(
+            solid_mask,
+            [max(contours, key=cv2.contourArea)],
+            -1,
+            255,
+            thickness=-1
+        )
+
+    distance = cv2.distanceTransform(solid_mask, cv2.DIST_L2, 5)
+    safe_width = max(18.0, min(h_img, w_img) * 0.12)
+    confidence = np.clip(distance / safe_width, 0.0, 1.0)
+    confidence = confidence * confidence * (3.0 - 2.0 * confidence)
+    return confidence.astype(np.float32)[:, :, None]
+
+
+def build_tone_matched_database_texture(
+    target_morph,
+    database_image,
+    source_confidence,
+    face_mask
+):
+    """用数据库真实皮肤补全边缘，并匹配当前比例已经生成的目标肤色。"""
+    confidence = source_confidence[:, :, 0]
+    coverage = face_mask[:, :, 0]
+    reliable_skin = (confidence >= 0.90) & (coverage >= 0.90)
+    if np.count_nonzero(reliable_skin) < 128:
+        return database_image
+
+    target_lab = cv2.cvtColor(target_morph, cv2.COLOR_BGR2LAB).astype(np.float32)
+    database_lab = cv2.cvtColor(
+        database_image,
+        cv2.COLOR_BGR2LAB
+    ).astype(np.float32)
+    skin_delta = np.median(
+        target_lab[reliable_skin] - database_lab[reliable_skin],
+        axis=0
+    )
+    skin_delta = np.clip(
+        skin_delta,
+        np.array([-72.0, -26.0, -26.0], dtype=np.float32),
+        np.array([72.0, 26.0, 26.0], dtype=np.float32)
+    )
+
+    # 全局中位数负责跨肤色的大范围校正；低频差分只在远离发际线的
+    # 可靠区域逐渐启用，使额头/面颊的光照连续，又不会把头发暗色扩散进来。
+    blur_sigma = max(8.0, min(database_image.shape[:2]) * 0.045)
+    target_low = cv2.GaussianBlur(
+        target_lab,
+        (0, 0),
+        sigmaX=blur_sigma,
+        sigmaY=blur_sigma,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+    database_low = cv2.GaussianBlur(
+        database_lab,
+        (0, 0),
+        sigmaX=blur_sigma,
+        sigmaY=blur_sigma,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+    local_delta = target_low - database_low
+    local_allowance = np.array([18.0, 8.0, 8.0], dtype=np.float32)
+    local_delta = np.clip(
+        local_delta,
+        skin_delta - local_allowance,
+        skin_delta + local_allowance
+    )
+    local_weight = np.clip(
+        (confidence - 0.18) / 0.67,
+        0.0,
+        1.0
+    )
+    local_weight = local_weight * local_weight * (3.0 - 2.0 * local_weight)
+    applied_delta = (
+        skin_delta[None, None, :] * (1.0 - local_weight[:, :, None]) +
+        local_delta * local_weight[:, :, None]
+    )
+    matched_lab = database_lab + applied_delta
+    return cv2.cvtColor(
+        np.clip(matched_lab, 0, 255).astype(np.uint8),
+        cv2.COLOR_LAB2BGR
+    )
+
+
+def composite_face_inward(face_image, base_image, face_mask):
+    """在数据库面部内部做平滑直接合成，禁止暗色跨发际线扩散。"""
     mask = np.clip(face_mask.astype(np.float32), 0.0, 1.0)
-
-    # 4*m*(1-m) 只在过渡带非零，面部中心和外部均不改变。
-    transition_weight = np.power(
-        np.clip(4.0 * mask * (1.0 - mask), 0.0, 1.0),
-        0.75
+    # smoothstep 使皮肤边缘连续，但保持掩膜外严格为数据库原图。
+    mask = mask * mask * (3.0 - 2.0 * mask)
+    result = (
+        face_image.astype(np.float32) * mask +
+        base_image.astype(np.float32) * (1.0 - mask)
     )
-    face_low = cv2.GaussianBlur(face, (0, 0), sigmaX=11.0, sigmaY=11.0)
-    base_low = cv2.GaussianBlur(base, (0, 0), sigmaX=11.0, sigmaY=11.0)
-    correction = np.clip(base_low - face_low, -42.0, 42.0)
-    return np.clip(
-        face + correction * transition_weight * 0.65,
-        0,
-        255
-    ).astype(np.uint8)
-
-
-def multiband_blend(foreground, background, mask, levels=4):
-    """使用拉普拉斯金字塔融合，避免单层透明叠加形成贴脸边缘。"""
-    fg = foreground.astype(np.float32)
-    bg = background.astype(np.float32)
-    blend_mask = np.repeat(
-        np.clip(mask.astype(np.float32), 0.0, 1.0),
-        3,
-        axis=2
-    )
-
-    fg_gaussian = [fg]
-    bg_gaussian = [bg]
-    mask_gaussian = [blend_mask]
-    for _ in range(levels):
-        if min(fg_gaussian[-1].shape[:2]) < 16:
-            break
-        fg_gaussian.append(cv2.pyrDown(fg_gaussian[-1]))
-        bg_gaussian.append(cv2.pyrDown(bg_gaussian[-1]))
-        mask_gaussian.append(cv2.pyrDown(mask_gaussian[-1]))
-
-    fg_laplacian = []
-    bg_laplacian = []
-    for level in range(len(fg_gaussian) - 1):
-        target_size = (
-            fg_gaussian[level].shape[1],
-            fg_gaussian[level].shape[0]
-        )
-        fg_laplacian.append(
-            fg_gaussian[level] -
-            cv2.pyrUp(fg_gaussian[level + 1], dstsize=target_size)
-        )
-        bg_laplacian.append(
-            bg_gaussian[level] -
-            cv2.pyrUp(bg_gaussian[level + 1], dstsize=target_size)
-        )
-    fg_laplacian.append(fg_gaussian[-1])
-    bg_laplacian.append(bg_gaussian[-1])
-
-    blended_levels = []
-    for fg_level, bg_level, mask_level in zip(
-        fg_laplacian,
-        bg_laplacian,
-        mask_gaussian
-    ):
-        blended_levels.append(
-            fg_level * mask_level + bg_level * (1.0 - mask_level)
-        )
-
-    result = blended_levels[-1]
-    for level in range(len(blended_levels) - 2, -1, -1):
-        target_size = (
-            blended_levels[level].shape[1],
-            blended_levels[level].shape[0]
-        )
-        result = cv2.pyrUp(result, dstsize=target_size) + blended_levels[level]
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def harmonize_face_boundary(face_image, base_image, face_mask):
+    """按位置匹配面缘低频光照，中央五官纹理保持不变。"""
+    mask = np.clip(face_mask[:, :, 0].astype(np.float32), 0.0, 1.0)
+    boundary_ring = (mask >= 0.18) & (mask <= 0.82)
+    if np.count_nonzero(boundary_ring) < 64:
+        return face_image
+
+    face_lab = cv2.cvtColor(face_image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    base_lab = cv2.cvtColor(base_image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    global_delta = np.median(
+        base_lab[boundary_ring] - face_lab[boundary_ring],
+        axis=0
+    )
+    global_delta = np.clip(
+        global_delta,
+        np.array([-48.0, -18.0, -18.0], dtype=np.float32),
+        np.array([48.0, 18.0, 18.0], dtype=np.float32)
+    )
+
+    # 数据库照片左右光照、胡须和太阳穴颜色通常不同。分别估计每个位置的
+    # 低频差异，比单一全局偏移更能消除“贴上一张椭圆脸”的边界。
+    blur_sigma = max(8.0, min(face_image.shape[:2]) * 0.040)
+    face_low = cv2.GaussianBlur(
+        face_lab,
+        (0, 0),
+        sigmaX=blur_sigma,
+        sigmaY=blur_sigma,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+    base_low = cv2.GaussianBlur(
+        base_lab,
+        (0, 0),
+        sigmaX=blur_sigma,
+        sigmaY=blur_sigma,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+    local_delta = base_low - face_low
+    local_delta = np.clip(
+        local_delta,
+        np.array([-64.0, -22.0, -22.0], dtype=np.float32),
+        np.array([64.0, 22.0, 22.0], dtype=np.float32)
+    )
+    local_delta = 0.85 * local_delta + 0.15 * global_delta[None, None, :]
+
+    edge_weight = np.where(
+        mask > 0.0,
+        np.power(1.0 - mask, 0.72),
+        0.0
+    ).astype(np.float32)
+    adjusted_lab = face_lab + edge_weight[:, :, None] * local_delta
+    return cv2.cvtColor(
+        np.clip(adjusted_lab, 0, 255).astype(np.uint8),
+        cv2.COLOR_LAB2BGR
+    )
 
 
 def blend_face_without_hair_ghosting(
@@ -577,39 +839,82 @@ def blend_face_without_hair_ghosting(
     warp2,
     points_avg,
     alpha,
+    database_base,
+    database_base_mask=None,
     warped_mask1=None,
     warped_mask2=None
 ):
-    """融合两张已几何变形的脸，并与数据库头发做无缝多尺度衔接。"""
-    blended_face = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
-
-    # 第二张图是同一组比例共用的数据库模板。其头发、背景和外轮廓
-    # 完整保留，只有掩膜内部的眼鼻口及面部区域随比例变化。
-    hair_base = warp2
+    """只把几何融合后的面部写入未形变数据库底图。"""
     face_mask = create_shared_face_blend_mask(
         warped_mask1,
         warped_mask2,
         points_avg,
-        blended_face.shape
+        warp1.shape,
+        base_face_mask=database_base_mask
     )
-    harmonized_face = harmonize_transition_tone(
-        blended_face,
-        hair_base,
+    source_confidence = create_source_texture_confidence(
+        warped_mask1,
+        warp1.shape,
+        target_face_mask=database_base_mask
+    )
+    subject_ratio = 1.0 - alpha
+    standard_morph = cv2.addWeighted(
+        warp1,
+        subject_ratio,
+        warp2,
+        alpha,
+        0
+    )
+    database_fill = build_tone_matched_database_texture(
+        standard_morph,
+        warp2,
+        source_confidence,
         face_mask
     )
-    # 金字塔会在各尺度采样边界外像素；先把边界外前景替换为底图，
-    # 即使在低分辨率层也不会把被试头发重新带进额头。
-    safe_foreground = np.where(
-        face_mask > 0.0,
-        harmonized_face,
-        hair_base
+    # 可靠区使用正常双脸融合；靠近被试发际线时换成已匹配目标肤色的
+    # 数据库真实皮肤纹理，杜绝被拉长的发丝进入额头。
+    blended_face = (
+        standard_morph.astype(np.float32) * source_confidence +
+        database_fill.astype(np.float32) * (1.0 - source_confidence)
     ).astype(np.uint8)
-    return multiband_blend(
-        safe_foreground,
-        hair_base,
-        face_mask,
-        levels=FACE_BLEND_PYRAMID_LEVELS
+
+    # 头发、耳朵、颈部和背景均取自未形变数据库图。耳颈自动肤色分割在
+    # 深肤色与胡须样本上容易误判，因此不让它参与面孔合成。
+    matched_database_base = database_base
+    harmonized_face = harmonize_face_boundary(
+        blended_face,
+        matched_database_base,
+        face_mask
     )
+    return composite_face_inward(
+        harmonized_face,
+        matched_database_base,
+        face_mask
+    )
+
+
+def interpolate_face_geometry(points1, points2, alpha):
+    """融合内部脸型，但将发际线和画布外圈固定到数据库照片。"""
+    source_points = np.asarray(points1, dtype=np.float32)
+    database_points = np.asarray(points2, dtype=np.float32)
+    target_points = (
+        (1.0 - alpha) * source_points +
+        alpha * database_points
+    )
+
+    if len(target_points) >= FACE_BOUNDARY_POINT_START:
+        forehead_end = (
+            FACE_FOREHEAD_POINT_START + FACE_FOREHEAD_POINT_COUNT
+        )
+        target_points[
+            FACE_FOREHEAD_POINT_START:forehead_end
+        ] = database_points[
+            FACE_FOREHEAD_POINT_START:forehead_end
+        ]
+        target_points[FACE_BOUNDARY_POINT_START:] = database_points[
+            FACE_BOUNDARY_POINT_START:
+        ]
+    return target_points
 
 
 def morph_faces_full(
@@ -629,6 +934,14 @@ def morph_faces_full(
         img1 = np.copy(img1_arr)
         img2 = np.copy(img2_arr)
 
+        # 两个端点是原图规则，不依赖另一张照片的检测或融合网格。
+        if alpha >= 1.0 - 1e-6:
+            endpoint_points = points2 if points2 is not None else np.empty((0, 2))
+            return img2, np.asarray(endpoint_points, dtype=np.float32)
+        if alpha <= 1e-6:
+            endpoint_points = points1 if points1 is not None else np.empty((0, 2))
+            return img1, np.asarray(endpoint_points, dtype=np.float32)
+
         if points1 is None:
             points1 = get_points(img1)
         if points2 is None:
@@ -636,7 +949,8 @@ def morph_faces_full(
 
         if len(points1) < 68 or len(points2) < 68 or len(points1) != len(points2):
             raise ValueError("The two facial landmark meshes are incompatible")
-        points_avg = (1 - alpha) * np.array(points1) + alpha * np.array(points2)
+
+        points_avg = interpolate_face_geometry(points1, points2, alpha)
         triangles = get_triangles(points_avg)
         if len(triangles) == 0:
             raise ValueError("Delaunay triangulation failed")
@@ -659,6 +973,8 @@ def morph_faces_full(
             warp2,
             points_avg,
             alpha,
+            img2,
+            face_mask2,
             warped_mask1,
             warped_mask2
         )
@@ -854,7 +1170,15 @@ def get_random_original_db_images(gender, count=3):
     folder = 'male' if gender == 'male' else 'female'
     path = os.path.join(DATABASE_PATH, folder)
     all_files = glob.glob(os.path.join(path, "*.jpg")) + glob.glob(os.path.join(path, "*.png"))
-    original_files = [f for f in all_files if "_uploaded" not in os.path.basename(f)]
+    original_files = [
+        filepath
+        for filepath in all_files
+        if (
+            "_uploaded" not in os.path.basename(filepath) and
+            os.path.basename(filepath).casefold()
+            not in DATABASE_EXCLUDED_FILENAMES
+        )
+    ]
     if not original_files:
         if not all_files:
             return []
@@ -866,7 +1190,10 @@ def get_random_original_db_images(gender, count=3):
     for selected_file in candidates:
         try:
             img_resized, points, face_mask = load_prepared_db_image(selected_file)
-            if len(points) >= 77 and face_mask is not None:
+            if (
+                len(points) >= FACE_BOUNDARY_POINT_START and
+                face_mask is not None
+            ):
                 selected_images.append(
                     (
                         img_resized,
@@ -979,7 +1306,10 @@ def process_images_experiment():
             img_partner_wide,
             partner_detected_points
         )
-        if len(self_points) < 77 or len(partner_points) < 77:
+        if (
+            len(self_points) < FACE_BOUNDARY_POINT_START or
+            len(partner_points) < FACE_BOUNDARY_POINT_START
+        ):
             return jsonify({
                 "error": "The visible face boundary could not be estimated reliably. Please use an evenly lit, front-facing photograph.",
                 "code": "FACE_BOUNDARY_ERROR"
@@ -988,7 +1318,7 @@ def process_images_experiment():
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
         partner_filename = save_uploaded_image(img_partner_wide, photo_batch_id, "partner")
-        print(f"✅ Images saved: {self_filename}, {partner_filename}")
+        print(f"[OK] Images saved: {self_filename}, {partner_filename}")
 
         result_images = []
         trial_id = 1
@@ -1168,13 +1498,13 @@ def save_data():
                     combined_df.to_excel(excel_master_path, index=False)
                 else:
                     new_df.to_excel(excel_master_path, index=False)
-                print(f"✅ Excel 更新成功: {excel_master_path}")
+                print(f"[OK] Excel updated: {excel_master_path}")
             except Exception as excel_err:
-                print(f"❌ Excel 写入失败 (文件可能被占用): {excel_err}")
+                print(f"[ERROR] Excel write failed: {excel_err}")
                 # 写入备份文件，防止数据丢失
                 backup_path = os.path.join(DATA_SAVE_PATH, f"backup_{participant_id}.xlsx")
                 new_df.to_excel(backup_path, index=False)
-                print(f"✅ 数据已保存到备份文件: {backup_path}")
+                print(f"[OK] Data saved to backup: {backup_path}")
 
         return jsonify({"status": "success", "participant_id": participant_id})
     except Exception as e:
