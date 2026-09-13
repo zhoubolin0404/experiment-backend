@@ -46,6 +46,10 @@ FACE_CROP_CHIN_MARGIN = 0.05
 FACE_BLEND_FOREHEAD_MARGIN = 0.38
 FACE_BLEND_EXPAND_RATIO = 0.025
 FACE_BLEND_FEATHER_RATIO = 0.055
+FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
+FACE_ALIGN_RIGHT_EYE = (0.66, 0.40)
+FACE_ALIGN_MOUTH = (0.50, 0.69)
+FACE_BLEND_PYRAMID_LEVELS = 4
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -67,8 +71,8 @@ except Exception as e:
     print(f"❌ 警告: Dlib 模型加载失败。请确保 '{PREDICTOR_PATH}' 文件存在。")
     print(e)
 
-# --- 核心图像处理函数 (保持不变) ---
-# 这些函数负责特征点检测、三角剖分、仿射变换和人脸融合
+# --- 核心图像处理函数 ---
+# 这些函数负责特征点检测、规范对齐、三角剖分、仿射变换和人脸融合。
 
 def get_points(image):
     try:
@@ -238,19 +242,104 @@ def create_face_blend_mask(points, image_shape):
     return mask.astype(np.float32)[:, :, None] / 255.0
 
 
+def harmonize_transition_tone(face_image, base_image, face_mask):
+    """只协调掩膜边缘的低频色调，保留面部中心真实肤色和五官细节。"""
+    face = face_image.astype(np.float32)
+    base = base_image.astype(np.float32)
+    mask = np.clip(face_mask.astype(np.float32), 0.0, 1.0)
+
+    # 4*m*(1-m) 只在过渡带非零，面部中心和外部均不改变。
+    transition_weight = np.power(
+        np.clip(4.0 * mask * (1.0 - mask), 0.0, 1.0),
+        0.75
+    )
+    face_low = cv2.GaussianBlur(face, (0, 0), sigmaX=11.0, sigmaY=11.0)
+    base_low = cv2.GaussianBlur(base, (0, 0), sigmaX=11.0, sigmaY=11.0)
+    correction = np.clip(base_low - face_low, -42.0, 42.0)
+    return np.clip(
+        face + correction * transition_weight * 0.65,
+        0,
+        255
+    ).astype(np.uint8)
+
+
+def multiband_blend(foreground, background, mask, levels=4):
+    """使用拉普拉斯金字塔融合，避免单层透明叠加形成贴脸边缘。"""
+    fg = foreground.astype(np.float32)
+    bg = background.astype(np.float32)
+    blend_mask = np.repeat(
+        np.clip(mask.astype(np.float32), 0.0, 1.0),
+        3,
+        axis=2
+    )
+
+    fg_gaussian = [fg]
+    bg_gaussian = [bg]
+    mask_gaussian = [blend_mask]
+    for _ in range(levels):
+        if min(fg_gaussian[-1].shape[:2]) < 16:
+            break
+        fg_gaussian.append(cv2.pyrDown(fg_gaussian[-1]))
+        bg_gaussian.append(cv2.pyrDown(bg_gaussian[-1]))
+        mask_gaussian.append(cv2.pyrDown(mask_gaussian[-1]))
+
+    fg_laplacian = []
+    bg_laplacian = []
+    for level in range(len(fg_gaussian) - 1):
+        target_size = (
+            fg_gaussian[level].shape[1],
+            fg_gaussian[level].shape[0]
+        )
+        fg_laplacian.append(
+            fg_gaussian[level] -
+            cv2.pyrUp(fg_gaussian[level + 1], dstsize=target_size)
+        )
+        bg_laplacian.append(
+            bg_gaussian[level] -
+            cv2.pyrUp(bg_gaussian[level + 1], dstsize=target_size)
+        )
+    fg_laplacian.append(fg_gaussian[-1])
+    bg_laplacian.append(bg_gaussian[-1])
+
+    blended_levels = []
+    for fg_level, bg_level, mask_level in zip(
+        fg_laplacian,
+        bg_laplacian,
+        mask_gaussian
+    ):
+        blended_levels.append(
+            fg_level * mask_level + bg_level * (1.0 - mask_level)
+        )
+
+    result = blended_levels[-1]
+    for level in range(len(blended_levels) - 2, -1, -1):
+        target_size = (
+            blended_levels[level].shape[1],
+            blended_levels[level].shape[0]
+        )
+        result = cv2.pyrUp(result, dstsize=target_size) + blended_levels[level]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def blend_face_without_hair_ghosting(warp1, warp2, points_avg, alpha):
-    """数据库图作为底图，在连续完整面部掩膜内融合皮肤和五官。"""
+    """融合两张已几何变形的脸，并与数据库头发做无缝多尺度衔接。"""
     blended_face = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
 
     # 第二张图是同一组比例共用的数据库模板。其头发、背景和外轮廓
     # 完整保留，只有掩膜内部的眼鼻口及面部区域随比例变化。
     hair_base = warp2
     face_mask = create_face_blend_mask(points_avg, blended_face.shape)
-    result = (
-        blended_face.astype(np.float32) * face_mask +
-        hair_base.astype(np.float32) * (1.0 - face_mask)
+    harmonized_face = harmonize_transition_tone(
+        blended_face,
+        hair_base,
+        face_mask
     )
-    return np.clip(result, 0, 255).astype(np.uint8)
+    return multiband_blend(
+        harmonized_face,
+        hair_base,
+        face_mask,
+        levels=FACE_BLEND_PYRAMID_LEVELS
+    )
 
 
 def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
@@ -358,6 +447,71 @@ def crop_face_region(image, landmarks, output_width, output_height):
         return cv2.resize(image, (output_width, output_height))
 
 
+def align_face_to_canvas(image, landmarks, output_width, output_height):
+    """按双眼和嘴部中心执行相似变换，使两张脸进入同一规范坐标系。"""
+    if image is None:
+        return None
+    if landmarks is None or len(landmarks) < 68:
+        return cv2.resize(image, (output_width, output_height))
+
+    try:
+        face_pts = np.asarray(landmarks[:68], dtype=np.float32)
+        left_eye = np.mean(face_pts[36:42], axis=0)
+        right_eye = np.mean(face_pts[42:48], axis=0)
+        mouth_center = (face_pts[48] + face_pts[54]) / 2.0
+        source_anchors = np.float32([
+            left_eye,
+            right_eye,
+            mouth_center
+        ])
+        destination_anchors = np.float32([
+            [FACE_ALIGN_LEFT_EYE[0] * output_width,
+             FACE_ALIGN_LEFT_EYE[1] * output_height],
+            [FACE_ALIGN_RIGHT_EYE[0] * output_width,
+             FACE_ALIGN_RIGHT_EYE[1] * output_height],
+            [FACE_ALIGN_MOUTH[0] * output_width,
+             FACE_ALIGN_MOUTH[1] * output_height]
+        ])
+
+        transform, _ = cv2.estimateAffinePartial2D(
+            source_anchors,
+            destination_anchors,
+            method=cv2.LMEDS
+        )
+        if transform is None or not np.all(np.isfinite(transform)):
+            return crop_face_region(
+                image,
+                landmarks,
+                output_width,
+                output_height
+            )
+
+        scale_area = abs(float(np.linalg.det(transform[:, :2])))
+        if scale_area < 1e-6:
+            return crop_face_region(
+                image,
+                landmarks,
+                output_width,
+                output_height
+            )
+
+        return cv2.warpAffine(
+            image,
+            transform,
+            (output_width, output_height),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_REFLECT_101
+        )
+    except Exception as e:
+        print(f"Error in align_face_to_canvas: {e}")
+        return crop_face_region(
+            image,
+            landmarks,
+            output_width,
+            output_height
+        )
+
+
 # --- 融合结果紧裁剪：保留面孔和头部，不保留肩部 ---
 def crop_face_tight(image, landmarks):
     return crop_face_region(image, landmarks, OUTPUT_WIDTH, OUTPUT_HEIGHT)
@@ -369,7 +523,7 @@ def crop_portrait_wide(image):
         points = get_points(image)
         if len(points) < 68:
             return cv2.resize(image, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        return crop_face_region(
+        return align_face_to_canvas(
             image,
             points,
             PROCESS_WIDTH,
@@ -448,7 +602,7 @@ def cv2_to_base64(img_arr):
         return ""
 
 def build_morph_stimulus(job):
-    """执行一个纯几何融合任务；关键点已预先计算，可安全并行。"""
+    """执行关键点形变、纹理混合及无缝边缘融合；可安全并行。"""
     ratio = job["ratio"]
     alpha = 1.0 - ratio
     morphed_full, avg_points = morph_faces_full(
@@ -458,7 +612,15 @@ def build_morph_stimulus(job):
         points1=job["subject_points"],
         points2=job["database_points"]
     )
-    final_face = crop_face_tight(morphed_full, avg_points)
+    # 两张输入已经处于同一规范坐标系，避免再次裁剪造成各比例脸部大小跳动。
+    if morphed_full.shape[:2] == (OUTPUT_HEIGHT, OUTPUT_WIDTH):
+        final_face = morphed_full
+    else:
+        final_face = cv2.resize(
+            morphed_full,
+            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            interpolation=cv2.INTER_LANCZOS4
+        )
 
     result = {
         "id": f"stim_{job['trial_id']}",
