@@ -43,9 +43,10 @@ MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 FACE_CROP_SIDE_MARGIN = 0.04
 FACE_CROP_FOREHEAD_MARGIN = 0.42
 FACE_CROP_CHIN_MARGIN = 0.05
-FACE_BLEND_FOREHEAD_MARGIN = 0.38
-FACE_BLEND_EXPAND_RATIO = 0.025
-FACE_BLEND_FEATHER_RATIO = 0.055
+FACE_BLEND_FOREHEAD_MARGIN = 0.20
+FACE_HAIRLINE_MAX_MARGIN = 0.60
+FACE_HAIRLINE_MIN_MARGIN = 0.04
+FACE_MASK_INNER_FEATHER_RATIO = 0.045
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
 FACE_ALIGN_RIGHT_EYE = (0.66, 0.40)
 FACE_ALIGN_MOUTH = (0.50, 0.69)
@@ -161,8 +162,9 @@ def morph_triangle(img_src, img_dst, t_src, t_dst):
         return None
 
 def warp_image(img, src_points, dst_points, triangles):
-    # 以原图初始化，三角形取整产生的极小空隙会保留原始底图颜色。
-    warped_img = np.copy(img)
+    # 与参考算法一致，从空目标画布开始写入，禁止失败区域保留原图造成“贴图”。
+    warped_img = np.zeros_like(img)
+    coverage = np.zeros(img.shape[:2], dtype=np.float32)
     for i in triangles:
         x, y, z = i[0], i[1], i[2]
         t_src = [src_points[x], src_points[y], src_points[z]]
@@ -181,65 +183,314 @@ def warp_image(img, src_points, dst_points, triangles):
         warp_slice = warped_tri[y1-y:y2-y, x1-x:x2-x]
         current_slice = warped_img[y1:y2, x1:x2]
         warped_img[y1:y2, x1:x2] = current_slice * (1 - mask_slice) + warp_slice * mask_slice
+        coverage[y1:y2, x1:x2] = np.maximum(
+            coverage[y1:y2, x1:x2],
+            mask_slice[:, :, 0]
+        )
+
+    missing = coverage < 0.5
+    missing_ratio = float(np.mean(missing))
+    if missing_ratio > 0.02:
+        raise ValueError(
+            f"Incomplete triangulation coverage: {missing_ratio:.1%}"
+        )
+    # 仅补偿三角形取整造成的极少数边缘像素，不允许大块回退为原图。
+    warped_img[missing] = img[missing]
     return warped_img
 
 
-def create_face_blend_mask(points, image_shape):
-    """创建与肤色无关、内部连续且避开发际线的完整面部掩膜。"""
+def warp_face_mask(mask, src_points, dst_points, triangles):
+    """使用与照片完全相同的三角网格形变可见面部掩膜。"""
+    if mask is None:
+        return None
+    mask_three_channel = np.repeat(mask[:, :, None], 3, axis=2)
+    warped = warp_image(
+        mask_three_channel,
+        src_points,
+        dst_points,
+        triangles
+    )
+    return warped[:, :, 0]
+
+
+def build_face_contour_mask(points, image_shape, forehead_points=None):
+    """用下颌线和连续额头曲线构造无孔洞的可见面部区域。"""
     h_img, w_img = image_shape[:2]
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     if points is None or len(points) < 68:
-        return mask.astype(np.float32)[:, :, None]
+        return mask
 
     face_pts = np.asarray(points[:68], dtype=np.float32)
     jaw = face_pts[0:17]
     brows = face_pts[17:27]
     jaw_left = float(np.min(jaw[:, 0]))
     jaw_right = float(np.max(jaw[:, 0]))
-    brow_left = float(np.min(brows[:, 0]))
-    brow_right = float(np.max(brows[:, 0]))
     brow_top = float(np.min(brows[:, 1]))
     chin_y = float(np.max(jaw[:, 1]))
     face_width = max(1.0, jaw_right - jaw_left)
     face_height = max(1.0, chin_y - brow_top)
-    center_x = (jaw_left + jaw_right) / 2.0
 
-    # dlib 的 68 点不含发际线，因此用眉毛—下巴高度构造稳定的额头上缘。
-    # 掩膜只由几何位置决定，不再按肤色阈值筛选，避免不同人种融合时出现孔洞。
-    forehead_top = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
-    forehead_points = np.array([
-        [brow_left - 0.06 * face_width, brow_top],
-        [center_x - 0.38 * face_width, forehead_top + 0.06 * face_height],
-        [center_x, forehead_top],
-        [center_x + 0.38 * face_width, forehead_top + 0.06 * face_height],
-        [brow_right + 0.06 * face_width, brow_top]
-    ], dtype=np.float32)
-    full_face_hull = cv2.convexHull(
-        np.int32(np.round(np.vstack([jaw, brows, forehead_points])))
-    )
-    cv2.fillConvexPoly(mask, full_face_hull, 255, lineType=cv2.LINE_AA)
+    if forehead_points is None:
+        # 仅作为检测失败时的保守回退；不会向上猜到通常的发际线位置。
+        x_fractions = np.linspace(0.04, 0.96, 9, dtype=np.float32)
+        arc_offsets = np.array(
+            [0.12, 0.07, 0.03, 0.01, 0.0, 0.01, 0.03, 0.07, 0.12],
+            dtype=np.float32
+        )
+        forehead_top = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
+        forehead_points = np.column_stack([
+            jaw_left + x_fractions * face_width,
+            forehead_top + arc_offsets * face_height
+        ])
+    else:
+        forehead_points = np.asarray(forehead_points, dtype=np.float32)
 
-    # 略微向外扩张，使下颌、脸颊和太阳穴完整覆盖；实心凸包保证内部无孔洞。
-    expand_size = max(3, int(round(face_width * FACE_BLEND_EXPAND_RATIO)))
-    if expand_size % 2 == 0:
-        expand_size += 1
-    expand_size = min(expand_size, 31)
-    expand_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (expand_size, expand_size)
+    # 下颌点按左到右排列，额头点反向闭合；fillPoly 可保留刘海造成的凹形边界。
+    contour = np.vstack([jaw, forehead_points[::-1]])
+    contour[:, 0] = np.clip(contour[:, 0], 0, w_img - 1)
+    contour[:, 1] = np.clip(contour[:, 1], 0, h_img - 1)
+    cv2.fillPoly(
+        mask,
+        [np.int32(np.round(contour))],
+        255,
+        lineType=cv2.LINE_AA
     )
-    mask = cv2.dilate(mask, expand_kernel, iterations=1)
+    return mask
 
-    # 宽渐变带只作用于轮廓边缘，内部仍保持完整融合；可柔化跨肤色边界。
-    feather_size = max(
-        9,
-        int(round(min(h_img, w_img) * FACE_BLEND_FEATHER_RATIO))
+
+def estimate_visible_forehead_points(image, points):
+    """用人脸内部种子引导 GrabCut，估计当前照片实际可见的连续额头上缘。"""
+    if image is None or points is None or len(points) < 68:
+        return None
+
+    face_pts = np.asarray(points[:68], dtype=np.float32)
+    jaw = face_pts[0:17]
+    brows = face_pts[17:27]
+    jaw_left = float(np.min(jaw[:, 0]))
+    jaw_right = float(np.max(jaw[:, 0]))
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_width = max(1.0, jaw_right - jaw_left)
+    face_height = max(1.0, chin_y - brow_top)
+    h_img, w_img = image.shape[:2]
+
+    x_fractions = np.linspace(0.04, 0.96, 9, dtype=np.float32)
+    sample_x = jaw_left + x_fractions * face_width
+    min_y = max(0, int(round(
+        brow_top - FACE_HAIRLINE_MAX_MARGIN * face_height
+    )))
+    max_y = min(h_img - 1, int(round(brow_top + 0.12 * face_height)))
+    minimum_visible_y = brow_top - FACE_HAIRLINE_MIN_MARGIN * face_height
+    fallback_top = brow_top - FACE_BLEND_FOREHEAD_MARGIN * face_height
+    fallback_offsets = np.array(
+        [0.12, 0.07, 0.03, 0.01, 0.0, 0.01, 0.03, 0.07, 0.12],
+        dtype=np.float32
+    ) * face_height
+    detected_y = fallback_top + fallback_offsets
+
+    try:
+        candidate_top = brow_top - FACE_HAIRLINE_MAX_MARGIN * face_height
+        candidate_offsets = np.array(
+            [0.18, 0.10, 0.05, 0.02, 0.0, 0.02, 0.05, 0.10, 0.18],
+            dtype=np.float32
+        ) * face_height
+        candidate_forehead = np.column_stack([
+            sample_x,
+            candidate_top + candidate_offsets
+        ])
+        candidate_mask = build_face_contour_mask(
+            points,
+            image.shape,
+            candidate_forehead
+        )
+
+        grabcut_mask = np.full(
+            (h_img, w_img),
+            cv2.GC_BGD,
+            dtype=np.uint8
+        )
+        grabcut_mask[candidate_mask > 0] = cv2.GC_PR_FGD
+
+        sure_face = np.zeros((h_img, w_img), dtype=np.uint8)
+        seed_radius = max(4, int(round(face_width * 0.035)))
+        seed_centers = [
+            0.58 * face_pts[31] + 0.42 * face_pts[3],
+            0.58 * face_pts[35] + 0.42 * face_pts[13],
+            face_pts[27] + np.array([0.0, 0.04 * face_height], dtype=np.float32),
+            face_pts[30]
+        ]
+        for center in seed_centers:
+            cv2.circle(
+                sure_face,
+                tuple(np.int32(np.round(center))),
+                seed_radius,
+                255,
+                -1,
+                lineType=cv2.LINE_AA
+            )
+        grabcut_mask[sure_face > 0] = cv2.GC_FGD
+
+        background_model = np.zeros((1, 65), dtype=np.float64)
+        foreground_model = np.zeros((1, 65), dtype=np.float64)
+        cv2.grabCut(
+            image,
+            grabcut_mask,
+            None,
+            background_model,
+            foreground_model,
+            5,
+            cv2.GC_INIT_WITH_MASK
+        )
+        segmented = np.where(
+            (grabcut_mask == cv2.GC_FGD) |
+            (grabcut_mask == cv2.GC_PR_FGD),
+            255,
+            0
+        ).astype(np.uint8)
+        segmented = cv2.bitwise_and(segmented, candidate_mask)
+        segmented = cv2.morphologyEx(
+            segmented,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=2
+        )
+
+        # 只保留与确定面部种子重叠最多的连通区域，排除独立的头发和背景块。
+        count, labels, _, _ = cv2.connectedComponentsWithStats(
+            (segmented > 0).astype(np.uint8),
+            connectivity=8
+        )
+        best_label = 0
+        best_overlap = 0
+        for label in range(1, count):
+            overlap = int(np.count_nonzero(
+                (labels == label) & (sure_face > 0)
+            ))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_label = label
+        if best_label == 0:
+            return np.column_stack([sample_x, detected_y])
+        visible_component = np.where(labels == best_label, 255, 0).astype(np.uint8)
+
+        window_radius = max(2, int(round(face_width * 0.015)))
+        for index, x_value in enumerate(sample_x):
+            x_center = int(round(x_value))
+            x1 = max(0, x_center - window_radius)
+            x2 = min(w_img, x_center + window_radius + 1)
+            if x1 >= x2 or min_y >= max_y:
+                continue
+            profile = np.mean(
+                visible_component[min_y:max_y + 1, x1:x2] > 0,
+                axis=1
+            ) >= 0.35
+            profile = cv2.morphologyEx(
+                (profile.astype(np.uint8) * 255)[:, None],
+                cv2.MORPH_CLOSE,
+                np.ones((9, 1), dtype=np.uint8)
+            )[:, 0] > 0
+            visible_rows = np.flatnonzero(profile)
+            if visible_rows.size:
+                # 小分位数比直接取最顶像素更能抵抗少量误分类噪声。
+                top_index = int(np.quantile(visible_rows, 0.04))
+                detected_y[index] = float(min_y + top_index)
+
+        # 对发际线做短范围中值平滑，同时保留中央刘海形成的真实凹口。
+        smoothed_y = detected_y.copy()
+        for index in range(len(detected_y)):
+            left = max(0, index - 1)
+            right = min(len(detected_y), index + 2)
+            smoothed_y[index] = float(np.median(detected_y[left:right]))
+        detected_y = np.clip(
+            smoothed_y,
+            min_y,
+            minimum_visible_y
+        )
+    except Exception as e:
+        print(f"Visible forehead estimation fallback: {e}")
+
+    return np.column_stack([sample_x, detected_y]).astype(np.float32)
+
+
+def create_visible_face_mask(image, points, forehead_points=None):
+    """为单张照片生成实心可见面部掩膜，不把该照片的头发当成额头。"""
+    if forehead_points is None:
+        forehead_points = estimate_visible_forehead_points(image, points)
+    mask = build_face_contour_mask(points, image.shape, forehead_points)
+    # 向内收一小圈，边缘稍后用距离变换在脸内完成渐变。
+    return cv2.erode(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1
     )
-    if feather_size % 2 == 0:
-        feather_size += 1
-    feather_size = min(feather_size, 71)
-    mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
-    return mask.astype(np.float32)[:, :, None] / 255.0
+
+
+def prepare_face_geometry(image, points):
+    """将实际额头边界加入 68 点网格，并返回与其一致的可见面部掩膜。"""
+    if image is None or points is None or len(points) < 68:
+        return np.array([]), None
+
+    forehead_points = estimate_visible_forehead_points(image, points)
+    if forehead_points is None or len(forehead_points) != 9:
+        return np.array([]), None
+
+    h_img, w_img = image.shape[:2]
+    x_max = w_img - 1
+    y_max = h_img - 1
+    boundary_points = np.float32([
+        [0, 0], [x_max // 2, 0], [x_max, 0],
+        [x_max, y_max // 2], [x_max, y_max], [x_max // 2, y_max],
+        [0, y_max], [0, y_max // 2]
+    ])
+    geometry_points = np.vstack([
+        np.asarray(points[:68], dtype=np.float32),
+        np.asarray(forehead_points, dtype=np.float32),
+        boundary_points
+    ])
+    visible_mask = create_visible_face_mask(
+        image,
+        geometry_points,
+        forehead_points=forehead_points
+    )
+    return geometry_points, visible_mask
+
+
+def create_shared_face_blend_mask(mask1, mask2, points, image_shape):
+    """取两张照片可见面部的连续交集，并生成不会越过发际线的内向羽化。"""
+    h_img, w_img = image_shape[:2]
+    if mask1 is None or mask2 is None:
+        hard_mask = build_face_contour_mask(points, image_shape)
+    else:
+        hard_mask = np.where(
+            (mask1 > 127) & (mask2 > 127),
+            255,
+            0
+        ).astype(np.uint8)
+
+    hard_mask = cv2.morphologyEx(
+        hard_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1
+    )
+    contours, _ = cv2.findContours(
+        hard_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    solid_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(solid_mask, [largest], -1, 255, thickness=-1)
+
+    # 距离变换只在面部内部增加权重；掩膜外始终为零，所以头发不会参与融合。
+    distance = cv2.distanceTransform(solid_mask, cv2.DIST_L2, 5)
+    feather_width = max(
+        8.0,
+        min(h_img, w_img) * FACE_MASK_INNER_FEATHER_RATIO
+    )
+    soft_mask = np.clip(distance / feather_width, 0.0, 1.0)
+    return soft_mask.astype(np.float32)[:, :, None]
 
 
 def harmonize_transition_tone(face_image, base_image, face_mask):
@@ -321,28 +572,55 @@ def multiband_blend(foreground, background, mask, levels=4):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def blend_face_without_hair_ghosting(warp1, warp2, points_avg, alpha):
+def blend_face_without_hair_ghosting(
+    warp1,
+    warp2,
+    points_avg,
+    alpha,
+    warped_mask1=None,
+    warped_mask2=None
+):
     """融合两张已几何变形的脸，并与数据库头发做无缝多尺度衔接。"""
     blended_face = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
 
     # 第二张图是同一组比例共用的数据库模板。其头发、背景和外轮廓
     # 完整保留，只有掩膜内部的眼鼻口及面部区域随比例变化。
     hair_base = warp2
-    face_mask = create_face_blend_mask(points_avg, blended_face.shape)
+    face_mask = create_shared_face_blend_mask(
+        warped_mask1,
+        warped_mask2,
+        points_avg,
+        blended_face.shape
+    )
     harmonized_face = harmonize_transition_tone(
         blended_face,
         hair_base,
         face_mask
     )
-    return multiband_blend(
+    # 金字塔会在各尺度采样边界外像素；先把边界外前景替换为底图，
+    # 即使在低分辨率层也不会把被试头发重新带进额头。
+    safe_foreground = np.where(
+        face_mask > 0.0,
         harmonized_face,
+        hair_base
+    ).astype(np.uint8)
+    return multiband_blend(
+        safe_foreground,
         hair_base,
         face_mask,
         levels=FACE_BLEND_PYRAMID_LEVELS
     )
 
 
-def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
+def morph_faces_full(
+    img1_arr,
+    img2_arr,
+    alpha=0.5,
+    points1=None,
+    points2=None,
+    face_mask1=None,
+    face_mask2=None
+):
     try:
         if img1_arr.shape[:2] != (PROCESS_HEIGHT, PROCESS_WIDTH):
             img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
@@ -357,23 +635,37 @@ def morph_faces_full(img1_arr, img2_arr, alpha=0.5, points1=None, points2=None):
             points2 = get_points(img2)
 
         if len(points1) < 68 or len(points2) < 68 or len(points1) != len(points2):
-            # 无法可靠定位五官时保留数据库模板，禁止退化为整图透明叠加。
-            return img2, None
+            raise ValueError("The two facial landmark meshes are incompatible")
         points_avg = (1 - alpha) * np.array(points1) + alpha * np.array(points2)
         triangles = get_triangles(points_avg)
+        if len(triangles) == 0:
+            raise ValueError("Delaunay triangulation failed")
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
+        warped_mask1 = warp_face_mask(
+            face_mask1,
+            points1,
+            points_avg,
+            triangles
+        )
+        warped_mask2 = warp_face_mask(
+            face_mask2,
+            points2,
+            points_avg,
+            triangles
+        )
         final_img = blend_face_without_hair_ghosting(
             warp1,
             warp2,
             points_avg,
-            alpha
+            alpha,
+            warped_mask1,
+            warped_mask2
         )
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
-        s2 = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        return s2, None
+        raise RuntimeError(f"Face morphing failed: {e}") from e
 
 def crop_face_region(image, landmarks, output_width, output_height):
     """按面部关键点标准化裁剪，只保留头部并在下巴下方留下极小余量。"""
@@ -546,15 +838,16 @@ def save_uploaded_image(image, photo_batch_id, role):
 
 @lru_cache(maxsize=256)
 def load_prepared_db_image(filepath):
-    """缓存素材照片的裁剪结果和关键点，后续被试可直接复用。"""
+    """缓存素材照片的对齐结果、关键点和可见面部掩膜。"""
     img = cv2.imread(filepath)
     if img is None:
         raise ValueError(f"Cannot read database image: {filepath}")
     img_resized = crop_portrait_wide(img)
     if img_resized is None:
         img_resized = cv2.resize(img, (PROCESS_WIDTH, PROCESS_HEIGHT))
-    points = get_points(img_resized)
-    return img_resized, points
+    detected_points = get_points(img_resized)
+    points, face_mask = prepare_face_geometry(img_resized, detected_points)
+    return img_resized, points, face_mask
 
 def get_random_original_db_images(gender, count=3):
     """随机选取指定数量的不重复同性数据库面孔，并完成裁剪和关键点预处理。"""
@@ -572,10 +865,15 @@ def get_random_original_db_images(gender, count=3):
     selected_images = []
     for selected_file in candidates:
         try:
-            img_resized, points = load_prepared_db_image(selected_file)
-            if len(points) >= 68:
+            img_resized, points, face_mask = load_prepared_db_image(selected_file)
+            if len(points) >= 77 and face_mask is not None:
                 selected_images.append(
-                    (img_resized, os.path.basename(selected_file), points)
+                    (
+                        img_resized,
+                        os.path.basename(selected_file),
+                        points,
+                        face_mask
+                    )
                 )
                 if len(selected_images) == count:
                     break
@@ -610,7 +908,9 @@ def build_morph_stimulus(job):
         job["database_image"],
         alpha,
         points1=job["subject_points"],
-        points2=job["database_points"]
+        points2=job["database_points"],
+        face_mask1=job["subject_mask"],
+        face_mask2=job["database_mask"]
     )
     # 两张输入已经处于同一规范坐标系，避免再次裁剪造成各比例脸部大小跳动。
     if morphed_full.shape[:2] == (OUTPUT_HEIGHT, OUTPUT_WIDTH):
@@ -650,13 +950,13 @@ def process_images_experiment():
         img_partner_wide = crop_portrait_wide(raw_partner)
 
         # 上传照片的关键点只计算一次，供全部融合比例复用。
-        self_points = get_points(img_self_wide)
-        partner_points = get_points(img_partner_wide)
+        self_detected_points = get_points(img_self_wide)
+        partner_detected_points = get_points(img_partner_wide)
 
         invalid_roles = []
-        if len(self_points) < 68:
+        if len(self_detected_points) < 68:
             invalid_roles.append("your photograph")
-        if len(partner_points) < 68:
+        if len(partner_detected_points) < 68:
             invalid_roles.append("your partner's photograph")
 
         if invalid_roles:
@@ -668,6 +968,21 @@ def process_images_experiment():
                       "sunglasses, or face coverings, then try again."
                 ),
                 "code": "FACE_QUALITY_ERROR"
+            }), 422
+
+        # 每张上传照片独立估计实际可见额头，并将曲线加入三角形变网格。
+        self_points, self_face_mask = prepare_face_geometry(
+            img_self_wide,
+            self_detected_points
+        )
+        partner_points, partner_face_mask = prepare_face_geometry(
+            img_partner_wide,
+            partner_detected_points
+        )
+        if len(self_points) < 77 or len(partner_points) < 77:
+            return jsonify({
+                "error": "The visible face boundary could not be estimated reliably. Please use an evenly lit, front-facing photograph.",
+                "code": "FACE_BOUNDARY_ERROR"
             }), 422
 
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -690,14 +1005,16 @@ def process_images_experiment():
             }), 500
 
         # 1. Self Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points) in enumerate(self_db_faces, start=1):
+        for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(self_db_faces, start=1):
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
                     "subject_image": img_self_wide,
                     "subject_points": self_points,
+                    "subject_mask": self_face_mask,
                     "database_image": db_img,
                     "database_points": db_points,
+                    "database_mask": db_mask,
                     "ratio": ratio,
                     "ratio_key": "ratio_self",
                     "stimulus_type": "self_morph",
@@ -708,14 +1025,16 @@ def process_images_experiment():
                 trial_id += 1
 
         # 2. Partner Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points) in enumerate(partner_db_faces, start=1):
+        for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(partner_db_faces, start=1):
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
                     "subject_image": img_partner_wide,
                     "subject_points": partner_points,
+                    "subject_mask": partner_face_mask,
                     "database_image": db_img,
                     "database_points": db_points,
+                    "database_mask": db_mask,
                     "ratio": ratio,
                     "ratio_key": "ratio_partner",
                     "stimulus_type": "partner_morph",
