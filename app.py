@@ -38,15 +38,15 @@ OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
 MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 
-# 以 68 点中的眉毛、下颌轮廓为基准，只保留头部和面孔。
-# 下边界只越过下巴少量距离，避免肩部进入融合区域。
+# 以 68 点中的眉毛、下颌轮廓为基准，供检测失败时的矩形裁剪回退使用。
 FACE_CROP_SIDE_MARGIN = 0.04
 FACE_CROP_FOREHEAD_MARGIN = 0.42
 FACE_CROP_CHIN_MARGIN = 0.05
 FACE_BLEND_FOREHEAD_MARGIN = 0.20
 FACE_HAIRLINE_MAX_MARGIN = 0.60
 FACE_HAIRLINE_MIN_MARGIN = 0.04
-FACE_MASK_INNER_FEATHER_RATIO = 0.11
+FACE_MASK_INNER_FEATHER_RATIO = 0.06
+FACE_CANVAS_VALUE = 255
 FACE_FOREHEAD_POINT_START = 68
 FACE_FOREHEAD_POINT_COUNT = 17
 FACE_FOREHEAD_INTERIOR_ROWS = 2
@@ -59,15 +59,6 @@ FACE_BOUNDARY_POINT_START = (
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
 FACE_ALIGN_RIGHT_EYE = (0.66, 0.40)
 FACE_ALIGN_MOUTH = (0.50, 0.69)
-DATABASE_EXCLUDED_FILENAMES = {
-    # 镜框跨越融合边界会形成断裂伪影，不作为随机 morph 素材。
-    'nm-1010.jpg',
-    'nf-1006.jpg',
-    'nf-1021.jpg',
-    'nf-1040.jpg',
-    'nf-1077.jpg',
-    'nf-1103.jpg'
-}
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -244,7 +235,6 @@ def build_face_contour_mask(points, image_shape, forehead_points=None):
     jaw_right = float(np.max(jaw[:, 0]))
     brow_top = float(np.min(brows[:, 1]))
     chin_y = float(np.max(jaw[:, 1]))
-    face_width = max(1.0, jaw_right - jaw_left)
     face_height = max(1.0, chin_y - brow_top)
 
     if forehead_points is None:
@@ -530,7 +520,7 @@ def create_visible_face_mask(image, points, forehead_points=None):
     # 向内收一小圈，边缘稍后用距离变换在脸内完成渐变。
     return cv2.erode(
         mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
         iterations=1
     )
 
@@ -606,6 +596,50 @@ def prepare_face_geometry(image, points):
         forehead_points=forehead_points
     )
     return geometry_points, visible_mask
+
+
+def database_face_quality_issue(image, face_mask):
+    """返回严重曝光/色偏问题；不以天然肤色深浅作为排除条件。"""
+    if image is None or face_mask is None:
+        return "missing image or face mask"
+    pixels_mask = face_mask > 127
+    if np.count_nonzero(pixels_mask) < 512:
+        return "visible face area is too small"
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lightness = lab[:, :, 0][pixels_mask]
+    chroma = np.sqrt(
+        (lab[:, :, 1][pixels_mask] - 128.0) ** 2 +
+        (lab[:, :, 2][pixels_mask] - 128.0) ** 2
+    )
+    low, median, high = np.percentile(lightness, [5, 50, 95])
+    black_clip = float(np.mean(lightness <= 10.0))
+    white_clip = float(np.mean(lightness >= 248.0))
+
+    if median < 48.0 and black_clip > 0.10:
+        return "severely underexposed face"
+    if median > 232.0 and white_clip > 0.12:
+        return "severely overexposed face"
+    if high - low > 150.0 and low < 24.0:
+        return "extreme uneven facial lighting"
+    if np.median(chroma) > 62.0 and np.percentile(chroma, 90) > 78.0:
+        return "excessive facial colour cast"
+    return None
+
+
+def blend_face_textures_lab(subject_image, database_image, subject_ratio):
+    """在感知均匀的 LAB 空间混合纹理，降低跨肤色中间比例的灰脏感。"""
+    ratio = float(np.clip(subject_ratio, 0.0, 1.0))
+    subject_lab = cv2.cvtColor(subject_image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    database_lab = cv2.cvtColor(database_image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    blended_lab = (
+        ratio * subject_lab +
+        (1.0 - ratio) * database_lab
+    )
+    return cv2.cvtColor(
+        np.clip(blended_lab, 0, 255).astype(np.uint8),
+        cv2.COLOR_LAB2BGR
+    )
 
 
 def create_shared_face_blend_mask(
@@ -858,12 +892,10 @@ def blend_face_without_hair_ghosting(
         target_face_mask=database_base_mask
     )
     subject_ratio = 1.0 - alpha
-    standard_morph = cv2.addWeighted(
+    standard_morph = blend_face_textures_lab(
         warp1,
-        subject_ratio,
         warp2,
-        alpha,
-        0
+        subject_ratio
     )
     database_fill = build_tone_matched_database_texture(
         standard_morph,
@@ -878,8 +910,8 @@ def blend_face_without_hair_ghosting(
         database_fill.astype(np.float32) * (1.0 - source_confidence)
     ).astype(np.uint8)
 
-    # 头发、耳朵、颈部和背景均取自未形变数据库图。耳颈自动肤色分割在
-    # 深肤色与胡须样本上容易误判，因此不让它参与面孔合成。
+    # 头发、耳朵和矩形头像背景均取自未形变数据库图；面孔之外不做
+    # 颜色分类或几何变形，避免把侧光阴影误认为头发。
     matched_database_base = database_base
     harmonized_face = harmonize_face_boundary(
         blended_face,
@@ -894,7 +926,7 @@ def blend_face_without_hair_ghosting(
 
 
 def interpolate_face_geometry(points1, points2, alpha):
-    """融合内部脸型，但将发际线和画布外圈固定到数据库照片。"""
+    """融合五官几何，并把发际线与下颌固定到样本头部外框。"""
     source_points = np.asarray(points1, dtype=np.float32)
     database_points = np.asarray(points2, dtype=np.float32)
     target_points = (
@@ -903,6 +935,9 @@ def interpolate_face_geometry(points1, points2, alpha):
     )
 
     if len(target_points) >= FACE_BOUNDARY_POINT_START:
+        # 中间比例最终写回未变形的样本头部。固定下颌和发际线可使面孔
+        # 与样本耳朵、头发精确相接，避免不同脸宽造成椭圆贴图边。
+        target_points[0:17] = database_points[0:17]
         forehead_end = (
             FACE_FOREHEAD_POINT_START + FACE_FOREHEAD_POINT_COUNT
         )
@@ -1108,7 +1143,8 @@ def align_face_to_canvas(image, landmarks, output_width, output_height):
             transform,
             (output_width, output_height),
             flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_REFLECT_101
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(FACE_CANVAS_VALUE,) * 3
         )
     except Exception as e:
         print(f"Error in align_face_to_canvas: {e}")
@@ -1120,11 +1156,11 @@ def align_face_to_canvas(image, landmarks, output_width, output_height):
         )
 
 
-# --- 融合结果紧裁剪：保留面孔和头部，不保留肩部 ---
+# --- 固定比例矩形头像裁剪回退 ---
 def crop_face_tight(image, landmarks):
     return crop_face_region(image, landmarks, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
-# --- 面孔紧裁剪（用于融合前标准化上传图和数据库图） ---
+# --- 矩形头像标准化（用于上传图和数据库图） ---
 def crop_portrait_wide(image):
     if image is None: return None
     try:
@@ -1154,7 +1190,7 @@ def save_uploaded_image(image, photo_batch_id, role):
 
 @lru_cache(maxsize=256)
 def load_prepared_db_image(filepath):
-    """缓存素材照片的对齐结果、关键点和可见面部掩膜。"""
+    """缓存样本库的规范矩形头像、融合网格与可见面部掩膜。"""
     img = cv2.imread(filepath)
     if img is None:
         raise ValueError(f"Cannot read database image: {filepath}")
@@ -1163,6 +1199,11 @@ def load_prepared_db_image(filepath):
         img_resized = cv2.resize(img, (PROCESS_WIDTH, PROCESS_HEIGHT))
     detected_points = get_points(img_resized)
     points, face_mask = prepare_face_geometry(img_resized, detected_points)
+    quality_issue = database_face_quality_issue(img_resized, face_mask)
+    if quality_issue:
+        raise ValueError(
+            f"Database face quality rejected: {quality_issue}"
+        )
     return img_resized, points, face_mask
 
 def get_random_original_db_images(gender, count=3):
@@ -1173,11 +1214,7 @@ def get_random_original_db_images(gender, count=3):
     original_files = [
         filepath
         for filepath in all_files
-        if (
-            "_uploaded" not in os.path.basename(filepath) and
-            os.path.basename(filepath).casefold()
-            not in DATABASE_EXCLUDED_FILENAMES
-        )
+        if "_uploaded" not in os.path.basename(filepath)
     ]
     if not original_files:
         if not all_files:
@@ -1204,7 +1241,10 @@ def get_random_original_db_images(gender, count=3):
                 )
                 if len(selected_images) == count:
                     break
-        except Exception:
+        except Exception as e:
+            print(
+                f"Skipping database face {os.path.basename(selected_file)}: {e}"
+            )
             continue
     return selected_images
 
@@ -1314,6 +1354,30 @@ def process_images_experiment():
                 "error": "The visible face boundary could not be estimated reliably. Please use an evenly lit, front-facing photograph.",
                 "code": "FACE_BOUNDARY_ERROR"
             }), 422
+
+        quality_errors = []
+        self_quality_issue = database_face_quality_issue(
+            img_self_wide,
+            self_face_mask
+        )
+        partner_quality_issue = database_face_quality_issue(
+            img_partner_wide,
+            partner_face_mask
+        )
+        if self_quality_issue:
+            quality_errors.append(f"your photograph: {self_quality_issue}")
+        if partner_quality_issue:
+            quality_errors.append(
+                f"your partner's photograph: {partner_quality_issue}"
+            )
+        if quality_errors:
+            return jsonify({
+                "error": "Photo quality is unsuitable: " + "; ".join(quality_errors),
+                "code": "FACE_EXPOSURE_ERROR"
+            }), 422
+
+        # 双眼与嘴部已经被规范到同一坐标系。直接保留矩形头像内的头发、
+        # 耳朵和原背景，不再做人像抠图或下颌镂空。
 
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
