@@ -98,17 +98,18 @@ def get_points(image):
     try:
         if image is None: return np.array([])
         if detector is None or predictor is None: return np.array([])
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # 先使用快速检测；失败时再放大检测一次，以兼顾速度和成功率。
-        dets = detector(gray, 0)
+        
+        dets = detector(image, 1)
         if len(dets) == 0:
-            dets = detector(gray, 1)
-        if len(dets) == 0:
-            return np.array([])
+            h, w = image.shape[:2]
+            return np.array([
+                [0,0], [w//2,0], [w-1,0],
+                [w-1, h//2], [w-1, h-1], [w//2, h-1],
+                [0, h-1], [0, h//2]
+            ])
 
         detected_face = dets[0]
-        pose_landmarks = predictor(gray, detected_face)
+        pose_landmarks = predictor(image, detected_face)
         points = []
         for p in pose_landmarks.parts():
             points.append([p.x, p.y])
@@ -141,12 +142,7 @@ def affine_transform(input_image, input_triangle, output_triangle, size):
                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         return output_image
     except:
-        # 使用当前图像块填补失败区域，避免出现黑色或白色三角形。
-        return cv2.resize(
-            input_image,
-            (size[0], size[1]),
-            interpolation=cv2.INTER_LINEAR
-        )
+        return np.zeros((size[1], size[0], 3), dtype=np.uint8)
 
 def morph_triangle(img_src, img_dst, t_src, t_dst):
     try:
@@ -181,9 +177,7 @@ def morph_triangle(img_src, img_dst, t_src, t_dst):
         return None
 
 def warp_image(img, src_points, dst_points, triangles):
-    # 与参考算法一致，从空目标画布开始写入，禁止失败区域保留原图造成“贴图”。
-    warped_img = np.zeros_like(img)
-    coverage = np.zeros(img.shape[:2], dtype=np.float32)
+    warped_img = np.zeros(img.shape, dtype=img.dtype)
     for i in triangles:
         x, y, z = i[0], i[1], i[2]
         t_src = [src_points[x], src_points[y], src_points[z]]
@@ -202,19 +196,6 @@ def warp_image(img, src_points, dst_points, triangles):
         warp_slice = warped_tri[y1-y:y2-y, x1-x:x2-x]
         current_slice = warped_img[y1:y2, x1:x2]
         warped_img[y1:y2, x1:x2] = current_slice * (1 - mask_slice) + warp_slice * mask_slice
-        coverage[y1:y2, x1:x2] = np.maximum(
-            coverage[y1:y2, x1:x2],
-            mask_slice[:, :, 0]
-        )
-
-    missing = coverage < 0.5
-    missing_ratio = float(np.mean(missing))
-    if missing_ratio > 0.02:
-        raise ValueError(
-            f"Incomplete triangulation coverage: {missing_ratio:.1%}"
-        )
-    # 仅补偿三角形取整造成的极少数边缘像素，不允许大块回退为原图。
-    warped_img[missing] = img[missing]
     return warped_img
 
 
@@ -1071,70 +1052,42 @@ def morph_faces_full(
     face_mask2=None,
     subject_blur_sigma=0.0
 ):
+    """使用提供文件中的全图 Delaunay 三角形仿射与线性融合策略。"""
     try:
-        if img1_arr.shape[:2] != (PROCESS_HEIGHT, PROCESS_WIDTH):
-            img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        if img2_arr.shape[:2] != (PROCESS_HEIGHT, PROCESS_WIDTH):
-            img2_arr = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
+        img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
+        img2_arr = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
         img1 = np.copy(img1_arr)
         img2 = np.copy(img2_arr)
-
-        # 两个端点是原图规则，不依赖另一张照片的检测或融合网格。
-        if alpha >= 1.0 - 1e-6:
-            endpoint_points = points2 if points2 is not None else np.empty((0, 2))
-            return img2, np.asarray(endpoint_points, dtype=np.float32)
-        if alpha <= 1e-6:
-            endpoint_points = points1 if points1 is not None else np.empty((0, 2))
-            return img1, np.asarray(endpoint_points, dtype=np.float32)
 
         if points1 is None:
             points1 = get_points(img1)
         if points2 is None:
             points2 = get_points(img2)
 
-        if len(points1) < 68 or len(points2) < 68 or len(points1) != len(points2):
-            raise ValueError("The two facial landmark meshes are incompatible")
+        points1 = np.asarray(points1, dtype=np.float32)
+        points2 = np.asarray(points2, dtype=np.float32)
 
-        # 端点检查已经完成，因此这里只会影响 20–80% 的融合结果。
-        # 60%及以上完整匹配样本锐度，100%仍直接返回原始被试矩形头像。
-        img1 = soften_subject_for_morph(
-            img1,
-            subject_blur_sigma,
-            subject_ratio=1.0 - alpha
-        )
+        # 当前样本筛选仍可保留扩展额头网格；实际融合严格取提供文件使用的
+        # 68 个面部点和 8 个画布边界点。
+        if len(points1) > 76:
+            points1 = np.concatenate((points1[:68], points1[-8:]), axis=0)
+        if len(points2) > 76:
+            points2 = np.concatenate((points2[:68], points2[-8:]), axis=0)
 
-        points_avg = interpolate_face_geometry(points1, points2, alpha)
+        if len(points1) == 0 or len(points2) == 0 or len(points1) != len(points2):
+            return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
+
+        points_avg = (1 - alpha) * points1 + alpha * points2
         triangles = get_triangles(points_avg)
-        if len(triangles) == 0:
-            raise ValueError("Delaunay triangulation failed")
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
-        warped_mask1 = warp_face_mask(
-            face_mask1,
-            points1,
-            points_avg,
-            triangles
-        )
-        warped_mask2 = warp_face_mask(
-            face_mask2,
-            points2,
-            points_avg,
-            triangles
-        )
-        final_img = blend_face_without_hair_ghosting(
-            warp1,
-            warp2,
-            points_avg,
-            alpha,
-            img2,
-            face_mask2,
-            warped_mask1,
-            warped_mask2
-        )
+        final_img = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
-        raise RuntimeError(f"Face morphing failed: {e}") from e
+        s1 = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
+        s2 = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
+        return cv2.addWeighted(s1, 1-alpha, s2, alpha, 0), None
 
 def crop_face_region(image, landmarks, output_width, output_height):
     """按面部关键点标准化裁剪，只保留头部并在下巴下方留下极小余量。"""
@@ -1276,23 +1229,102 @@ def align_face_to_canvas(image, landmarks, output_width, output_height):
 
 # --- 固定比例矩形头像裁剪回退 ---
 def crop_face_tight(image, landmarks):
-    return crop_face_region(image, landmarks, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+    if image is None: return None
+    if landmarks is None or len(landmarks) < 68:
+        return cv2.resize(image, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+    h_img, w_img = image.shape[:2]
+    face_pts = landmarks[0:68]
+    min_x, max_x = np.min(face_pts[:, 0]), np.max(face_pts[:, 0])
+    min_y, max_y = np.min(face_pts[:, 1]), np.max(face_pts[:, 1])
+    face_w = max_x - min_x
+    face_h = max_y - min_y
+    center_x = (min_x + max_x) // 2
+    center_y = (min_y + max_y) // 2
+    target_aspect = 3.0 / 4.0
+    if face_h == 0: face_h = 1
+    face_aspect = face_w / face_h
+    if face_aspect > target_aspect:
+        crop_w = face_w
+        crop_h = crop_w / target_aspect
+    else:
+        crop_h = face_h
+        crop_w = crop_h * target_aspect
+    crop_w = int(crop_w)
+    crop_h = int(crop_h)
+    x1 = int(center_x - crop_w // 2)
+    y1 = int(center_y - crop_h // 2)
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
+    pad_left = max(0, -x1)
+    pad_top = max(0, -y1)
+    pad_right = max(0, x2 - w_img)
+    pad_bottom = max(0, y2 - h_img)
+    if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+        try:
+            img_padded = cv2.copyMakeBorder(
+                image,
+                pad_top,
+                pad_bottom,
+                pad_left,
+                pad_right,
+                cv2.BORDER_REFLECT_101
+            )
+            crop = img_padded[
+                y1 + pad_top:y2 + pad_top,
+                x1 + pad_left:x2 + pad_left
+            ]
+        except:
+            return cv2.resize(image, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+    else:
+        crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return cv2.resize(image, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+    return cv2.resize(
+        crop,
+        (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+        interpolation=cv2.INTER_LANCZOS4
+    )
 
 # --- 矩形头像标准化（用于上传图和数据库图） ---
 def crop_portrait_wide(image):
     if image is None: return None
+    h, w = image.shape[:2]
+    target_aspect = 3.0 / 4.0
     try:
-        points = get_points(image)
-        if len(points) < 68:
+        dets = detector(image, 1)
+        if len(dets) == 0:
             return cv2.resize(image, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        return align_face_to_canvas(
-            image,
-            points,
-            PROCESS_WIDTH,
-            PROCESS_HEIGHT
-        )
-    except Exception as e:
-        print(f"Error in crop_portrait_wide: {e}")
+        face = dets[0]
+        cx = (face.left() + face.right()) // 2
+        cy = (face.top() + face.bottom()) // 2
+        fw = face.right() - face.left()
+        crop_w = int(fw * 1.8)
+        crop_h = int(crop_w / target_aspect)
+        y1 = cy - int(crop_h * 0.45)
+        x1 = cx - crop_w // 2
+        y2 = y1 + crop_h
+        x2 = x1 + crop_w
+        pad_left = max(0, -x1)
+        pad_top = max(0, -y1)
+        pad_right = max(0, x2 - w)
+        pad_bottom = max(0, y2 - h)
+        if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+            img_padded = cv2.copyMakeBorder(
+                image,
+                pad_top,
+                pad_bottom,
+                pad_left,
+                pad_right,
+                cv2.BORDER_REFLECT_101
+            )
+            crop = img_padded[
+                y1 + pad_top:y2 + pad_top,
+                x1 + pad_left:x2 + pad_left
+            ]
+        else:
+            crop = image[y1:y2, x1:x2]
+        return cv2.resize(crop, (PROCESS_WIDTH, PROCESS_HEIGHT))
+    except:
         return cv2.resize(image, (PROCESS_WIDTH, PROCESS_HEIGHT))
 
 # --- 文件保存辅助函数 ---
@@ -1390,28 +1422,27 @@ def cv2_to_base64(img_arr):
         return ""
 
 def build_morph_stimulus(job):
-    """执行关键点形变、纹理混合及无缝边缘融合；可安全并行。"""
+    """按提供文件的三角形仿射算法生成单张刺激图。"""
     ratio = job["ratio"]
     alpha = 1.0 - ratio
-    morphed_full, avg_points = morph_faces_full(
-        job["subject_image"],
-        job["database_image"],
-        alpha,
-        points1=job["subject_points"],
-        points2=job["database_points"],
-        face_mask1=job["subject_mask"],
-        face_mask2=job["database_mask"],
-        subject_blur_sigma=job.get("subject_blur_sigma", 0.0)
-    )
-    # 两张输入已经处于同一规范坐标系，避免再次裁剪造成各比例脸部大小跳动。
-    if morphed_full.shape[:2] == (OUTPUT_HEIGHT, OUTPUT_WIDTH):
-        final_face = morphed_full
+
+    # 保持既定端点规则：0% 直接使用样本，100% 直接使用被试头像。
+    if ratio <= 1e-6:
+        morphed_full = job["database_image"]
+        avg_points = job["database_points"]
+    elif ratio >= 1.0 - 1e-6:
+        morphed_full = job["subject_image"]
+        avg_points = job["subject_points"]
     else:
-        final_face = cv2.resize(
-            morphed_full,
-            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-            interpolation=cv2.INTER_LANCZOS4
+        morphed_full, avg_points = morph_faces_full(
+            job["subject_image"],
+            job["database_image"],
+            alpha,
+            points1=job["subject_points"],
+            points2=job["database_points"]
         )
+
+    final_face = crop_face_tight(morphed_full, avg_points)
 
     result = {
         "id": f"stim_{job['trial_id']}",
@@ -1690,7 +1721,8 @@ def save_data():
             
         # 2. 只有当实验标记为 完成 (is_complete = True) 时，才去读写 Excel
         if is_complete:
-            print(f"📊 实验完成 (ID: {participant_id})，正在同步数据到 Excel...")
+            # Windows PowerShell 常使用 GBK 控制台，日志必须避免 emoji，否则会在保存前抛出编码异常。
+            print(f"[INFO] Experiment complete (ID: {participant_id}); syncing data to Excel...")
             excel_master_path = os.path.join(DATA_SAVE_PATH, 'all_experiment_data.xlsx')
             
             # --- 构建数据行 ---
