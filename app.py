@@ -16,6 +16,8 @@ from datetime import datetime
 import traceback
 import shutil
 import re
+import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import pandas as pd  # 数据处理库
@@ -37,6 +39,8 @@ PROCESS_HEIGHT = 533
 OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
 MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+DATA_SAVE_LOCK = threading.Lock()
+EXCEL_SAVE_LOCK = threading.Lock()
 
 # 以 68 点中的眉毛、下颌轮廓为基准，供检测失败时的矩形裁剪回退使用。
 FACE_CROP_SIDE_MARGIN = 0.04
@@ -1320,7 +1324,7 @@ def load_prepared_db_image(filepath):
         )
     return img_resized, points, face_mask
 
-def get_random_original_db_images(gender, count=3):
+def get_random_original_db_images(gender, count=3, excluded_filenames=None):
     """随机选取指定数量的不重复同性数据库面孔，并完成裁剪和关键点预处理。"""
     folder = 'male' if gender == 'male' else 'female'
     path = os.path.join(DATABASE_PATH, folder)
@@ -1335,7 +1339,12 @@ def get_random_original_db_images(gender, count=3):
             return []
         original_files = all_files
 
-    candidates = original_files.copy()
+    excluded_filenames = set(excluded_filenames or ())
+    candidates = [
+        filepath
+        for filepath in original_files
+        if os.path.basename(filepath) not in excluded_filenames
+    ]
     random.shuffle(candidates)
     selected_images = []
     for selected_file in candidates:
@@ -1505,8 +1514,18 @@ def process_images_experiment():
         morph_jobs = []
 
         # 本人和伴侣各自固定使用 3 个同性数据库面孔；同一面孔覆盖全部 6 个比例。
+        # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
         self_db_faces = get_random_original_db_images(self_gender, count=3)
-        partner_db_faces = get_random_original_db_images(partner_gender, count=3)
+        partner_excluded_filenames = (
+            {db_filename for _, db_filename, _, _ in self_db_faces}
+            if self_gender == partner_gender
+            else set()
+        )
+        partner_db_faces = get_random_original_db_images(
+            partner_gender,
+            count=3,
+            excluded_filenames=partner_excluded_filenames
+        )
         if len(self_db_faces) < 3 or len(partner_db_faces) < 3:
             return jsonify({
                 "error": "At least three valid same-gender database faces are required for each photograph.",
@@ -1615,22 +1634,59 @@ def delete_participant_faces():
 @app.route('/save_data', methods=['POST'])
 def save_data():
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON request body"}), 400
+
         # 如果是第一次请求，生成新的 ID
         participant_id = data.get('participant_id')
         if not participant_id:
             timestamp = int(time.time())
             participant_id = f"P_{timestamp}_{random.randint(1000,9999)}"
+        if not re.fullmatch(r'^P_[A-Za-z0-9_-]{3,96}$', str(participant_id)):
+            return jsonify({"error": "Invalid participant ID"}), 400
         
         data['participant_id'] = participant_id
         is_complete = data.get('is_complete', False)
         
-        # 1. 始终保存 JSON 文件 (作为实时备份)
+        # 1. JSON 是最终数据的主记录。采用锁和原子替换，避免自动保存与最终保存并发写坏文件。
         json_filename = f"experiment_data_{participant_id}.json"
         json_filepath = os.path.join(DATA_SAVE_PATH, json_filename)
-        
-        with open(json_filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        json_temp_path = None
+        with DATA_SAVE_LOCK:
+            existing_data = None
+            if os.path.isfile(json_filepath):
+                try:
+                    with open(json_filepath, 'r', encoding='utf-8') as existing_file:
+                        existing_data = json.load(existing_file)
+                except (OSError, ValueError):
+                    existing_data = None
+
+            # 已经完成的记录不能被稍后到达的旧自动保存请求降级覆盖。
+            preserve_completed_record = (
+                isinstance(existing_data, dict) and
+                existing_data.get('is_complete') is True and
+                not is_complete
+            )
+
+            if not preserve_completed_record:
+                json_temp_path = os.path.join(
+                    DATA_SAVE_PATH,
+                    f".{json_filename}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    with open(json_temp_path, 'w', encoding='utf-8') as temp_file:
+                        json.dump(data, temp_file, ensure_ascii=False, indent=2)
+                        temp_file.flush()
+                        os.fsync(temp_file.fileno())
+                    os.replace(json_temp_path, json_filepath)
+                finally:
+                    if json_temp_path and os.path.exists(json_temp_path):
+                        os.remove(json_temp_path)
+
+        excel_saved = None
+        excel_destination = None
+        excel_warning = None
             
         # 2. 只有当实验标记为 完成 (is_complete = True) 时，才去读写 Excel
         if is_complete:
@@ -1678,28 +1734,60 @@ def save_data():
             
             new_df = pd.DataFrame(rows)
             
-            # --- 写入 Excel (带文件锁保护) ---
-            try:
-                if os.path.exists(excel_master_path):
-                    # 读取旧 Excel
-                    old_df = pd.read_excel(excel_master_path)
-                    # 先删除该 ID 可能存在的旧记录 (防止重复)
-                    if 'Participant_ID' in old_df.columns:
-                        old_df = old_df[old_df['Participant_ID'] != participant_id]
-                    # 合并
-                    combined_df = pd.concat([old_df, new_df], ignore_index=True)
-                    combined_df.to_excel(excel_master_path, index=False)
-                else:
-                    new_df.to_excel(excel_master_path, index=False)
-                print(f"[OK] Excel updated: {excel_master_path}")
-            except Exception as excel_err:
-                print(f"[ERROR] Excel write failed: {excel_err}")
-                # 写入备份文件，防止数据丢失
-                backup_path = os.path.join(DATA_SAVE_PATH, f"backup_{participant_id}.xlsx")
-                new_df.to_excel(backup_path, index=False)
-                print(f"[OK] Data saved to backup: {backup_path}")
+            # --- 写入 Excel：串行处理并先写临时文件，避免多名被试同时完成时损坏主表。 ---
+            excel_temp_path = None
+            with EXCEL_SAVE_LOCK:
+                try:
+                    if os.path.exists(excel_master_path):
+                        old_df = pd.read_excel(excel_master_path)
+                        if 'Participant_ID' in old_df.columns:
+                            old_df = old_df[old_df['Participant_ID'] != participant_id]
+                        combined_df = pd.concat([old_df, new_df], ignore_index=True)
+                    else:
+                        combined_df = new_df
 
-        return jsonify({"status": "success", "participant_id": participant_id})
+                    excel_temp_path = os.path.join(
+                        DATA_SAVE_PATH,
+                        f".all_experiment_data.{uuid.uuid4().hex}.tmp.xlsx"
+                    )
+                    combined_df.to_excel(excel_temp_path, index=False)
+                    os.replace(excel_temp_path, excel_master_path)
+                    excel_saved = True
+                    excel_destination = 'master'
+                    print(f"[OK] Excel updated: {excel_master_path}")
+                except Exception as excel_err:
+                    excel_warning = f"Master Excel update failed: {excel_err}"
+                    print(f"[ERROR] {excel_warning}")
+                    backup_path = os.path.join(
+                        DATA_SAVE_PATH,
+                        f"backup_{participant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xlsx"
+                    )
+                    try:
+                        new_df.to_excel(backup_path, index=False)
+                        excel_saved = True
+                        excel_destination = 'backup'
+                        print(f"[OK] Data saved to backup: {backup_path}")
+                    except Exception as backup_err:
+                        excel_saved = False
+                        excel_warning = (
+                            f"{excel_warning}; backup Excel write failed: {backup_err}. "
+                            "The complete JSON record was saved successfully."
+                        )
+                        print(f"[ERROR] {excel_warning}")
+                finally:
+                    if excel_temp_path and os.path.exists(excel_temp_path):
+                        os.remove(excel_temp_path)
+
+        response_body = {
+            "status": "success",
+            "participant_id": participant_id,
+            "json_saved": True,
+            "excel_saved": excel_saved,
+            "excel_destination": excel_destination
+        }
+        if excel_warning:
+            response_body["warning"] = excel_warning
+        return jsonify(response_body)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
