@@ -47,6 +47,13 @@ FACE_HAIRLINE_MAX_MARGIN = 0.60
 FACE_HAIRLINE_MIN_MARGIN = 0.04
 FACE_MASK_INNER_FEATHER_RATIO = 0.06
 FACE_CANVAS_VALUE = 255
+# 被试照片通常来自手机，锐度明显高于样本库证件照。只在二者差异足够
+# 大时做轻度匹配，并限制最大模糊，避免损失眼鼻口的身份信息。
+SUBJECT_BLUR_TRIGGER_RATIO = 1.12
+SUBJECT_BLUR_MIN_SIGMA = 0.45
+SUBJECT_BLUR_MAX_SIGMA = 1.55
+SUBJECT_BLUR_START_RATIO = 0.35
+SUBJECT_BLUR_FULL_RATIO = 0.60
 FACE_FOREHEAD_POINT_START = 68
 FACE_FOREHEAD_POINT_COUNT = 17
 FACE_FOREHEAD_INTERIOR_ROWS = 2
@@ -642,6 +649,104 @@ def blend_face_textures_lab(subject_image, database_image, subject_ratio):
     )
 
 
+def measure_face_detail(image, face_mask):
+    """测量面部高频细节，忽略背景和面缘强对比造成的虚假锐度。"""
+    if image is None:
+        return 0.0
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if face_mask is None or face_mask.shape[:2] != gray.shape:
+        valid_mask = np.zeros(gray.shape, dtype=np.uint8)
+        margin_y = max(1, int(round(gray.shape[0] * 0.20)))
+        margin_x = max(1, int(round(gray.shape[1] * 0.20)))
+        valid_mask[
+            margin_y:gray.shape[0] - margin_y,
+            margin_x:gray.shape[1] - margin_x
+        ] = 255
+    else:
+        valid_mask = np.where(face_mask > 127, 255, 0).astype(np.uint8)
+        valid_mask = cv2.erode(
+            valid_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=1
+        )
+
+    detail = np.abs(
+        gray - cv2.GaussianBlur(
+            gray,
+            (0, 0),
+            sigmaX=1.0,
+            sigmaY=1.0,
+            borderType=cv2.BORDER_REFLECT_101
+        )
+    )
+    samples = detail[valid_mask > 0]
+    if samples.size < 128:
+        return 0.0
+
+    # 裁掉极少量眼睑、鼻孔等强边缘离群值，使分数主要反映照片纹理。
+    ceiling = float(np.percentile(samples, 95))
+    if ceiling <= 1e-6:
+        return 0.0
+    clipped = np.minimum(samples, ceiling)
+    return float(np.sqrt(np.mean(clipped * clipped)))
+
+
+def estimate_subject_blur_sigma(
+    subject_image,
+    database_image,
+    subject_face_mask,
+    database_face_mask
+):
+    """根据当前样本照片的清晰度估计被试照片所需的轻度模糊。"""
+    subject_detail = measure_face_detail(subject_image, subject_face_mask)
+    database_detail = measure_face_detail(database_image, database_face_mask)
+    if subject_detail <= 0.0 or database_detail <= 0.0:
+        return 0.0
+
+    detail_ratio = subject_detail / database_detail
+    if detail_ratio <= SUBJECT_BLUR_TRIGGER_RATIO:
+        return 0.0
+
+    excess_stops = np.log2(detail_ratio / SUBJECT_BLUR_TRIGGER_RATIO)
+    sigma = SUBJECT_BLUR_MIN_SIGMA + 0.55 * excess_stops
+    return float(np.clip(
+        sigma,
+        SUBJECT_BLUR_MIN_SIGMA,
+        SUBJECT_BLUR_MAX_SIGMA
+    ))
+
+
+def soften_subject_for_morph(image, blur_sigma, subject_ratio):
+    """从40%开始渐进降低被试锐度，60–80%使用完整匹配强度。"""
+    sigma = float(blur_sigma or 0.0)
+    ratio = float(np.clip(subject_ratio, 0.0, 1.0))
+    if sigma <= 0.0 or ratio <= SUBJECT_BLUR_START_RATIO:
+        return image
+
+    strength = np.clip(
+        (ratio - SUBJECT_BLUR_START_RATIO) /
+        (SUBJECT_BLUR_FULL_RATIO - SUBJECT_BLUR_START_RATIO),
+        0.0,
+        1.0
+    )
+    strength = strength * strength * (3.0 - 2.0 * strength)
+    blurred = cv2.GaussianBlur(
+        image,
+        (0, 0),
+        sigmaX=sigma,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+    return cv2.addWeighted(
+        blurred,
+        float(strength),
+        image,
+        float(1.0 - strength),
+        0.0
+    )
+
+
 def create_shared_face_blend_mask(
     mask1,
     mask2,
@@ -959,7 +1064,8 @@ def morph_faces_full(
     points1=None,
     points2=None,
     face_mask1=None,
-    face_mask2=None
+    face_mask2=None,
+    subject_blur_sigma=0.0
 ):
     try:
         if img1_arr.shape[:2] != (PROCESS_HEIGHT, PROCESS_WIDTH):
@@ -984,6 +1090,14 @@ def morph_faces_full(
 
         if len(points1) < 68 or len(points2) < 68 or len(points1) != len(points2):
             raise ValueError("The two facial landmark meshes are incompatible")
+
+        # 端点检查已经完成，因此这里只会影响 20–80% 的融合结果。
+        # 60%及以上完整匹配样本锐度，100%仍直接返回原始被试矩形头像。
+        img1 = soften_subject_for_morph(
+            img1,
+            subject_blur_sigma,
+            subject_ratio=1.0 - alpha
+        )
 
         points_avg = interpolate_face_geometry(points1, points2, alpha)
         triangles = get_triangles(points_avg)
@@ -1277,7 +1391,8 @@ def build_morph_stimulus(job):
         points1=job["subject_points"],
         points2=job["database_points"],
         face_mask1=job["subject_mask"],
-        face_mask2=job["database_mask"]
+        face_mask2=job["database_mask"],
+        subject_blur_sigma=job.get("subject_blur_sigma", 0.0)
     )
     # 两张输入已经处于同一规范坐标系，避免再次裁剪造成各比例脸部大小跳动。
     if morphed_full.shape[:2] == (OUTPUT_HEIGHT, OUTPUT_WIDTH):
@@ -1400,6 +1515,12 @@ def process_images_experiment():
 
         # 1. Self Morphs: 3 database identities × 6 ratios = 18 images
         for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(self_db_faces, start=1):
+            subject_blur_sigma = estimate_subject_blur_sigma(
+                img_self_wide,
+                db_img,
+                self_face_mask,
+                db_mask
+            )
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
@@ -1409,6 +1530,7 @@ def process_images_experiment():
                     "database_image": db_img,
                     "database_points": db_points,
                     "database_mask": db_mask,
+                    "subject_blur_sigma": subject_blur_sigma,
                     "ratio": ratio,
                     "ratio_key": "ratio_self",
                     "stimulus_type": "self_morph",
@@ -1420,6 +1542,12 @@ def process_images_experiment():
 
         # 2. Partner Morphs: 3 database identities × 6 ratios = 18 images
         for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(partner_db_faces, start=1):
+            subject_blur_sigma = estimate_subject_blur_sigma(
+                img_partner_wide,
+                db_img,
+                partner_face_mask,
+                db_mask
+            )
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
@@ -1429,6 +1557,7 @@ def process_images_experiment():
                     "database_image": db_img,
                     "database_points": db_points,
                     "database_mask": db_mask,
+                    "subject_blur_sigma": subject_blur_sigma,
                     "ratio": ratio,
                     "ratio_key": "ratio_partner",
                     "stimulus_type": "partner_morph",
