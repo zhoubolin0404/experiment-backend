@@ -18,6 +18,10 @@ import shutil
 import re
 import threading
 import uuid
+import urllib.parse
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import pandas as pd  # 数据处理库
@@ -29,6 +33,29 @@ CORS(app, resources={r"/*": {"origins": "*"}}, allow_headers=["Content-Type", "A
 
 # --- 全局配置变量 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_local_environment(env_filepath):
+    """读取不会提交到 Git 的本地 .env；已有系统环境变量拥有更高优先级。"""
+    if not os.path.isfile(env_filepath):
+        return
+    with open(env_filepath, 'r', encoding='utf-8') as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+load_local_environment(os.path.join(BASE_DIR, '.env'))
+
 PREDICTOR_PATH = os.path.join(BASE_DIR, 'shape_predictor_68_face_landmarks.dat')
 DATABASE_PATH = os.path.join(BASE_DIR, 'database')
 PARTICIPANT_FACES_PATH = os.path.join(BASE_DIR, 'participant_faces')
@@ -41,6 +68,14 @@ OUTPUT_HEIGHT = 533
 MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 DATA_SAVE_LOCK = threading.Lock()
 EXCEL_SAVE_LOCK = threading.Lock()
+SONA_COMPLETION_API_URL = os.environ.get(
+    'SONA_COMPLETION_API_URL',
+    'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
+)
+SONA_EXPERIMENT_ID = os.environ.get('SONA_EXPERIMENT_ID', '2514')
+# 安全起见，credit token 只能由后端环境变量提供，不能提交到公开仓库。
+SONA_CREDIT_TOKEN = os.environ.get('SONA_CREDIT_TOKEN', '').strip()
+SONA_REQUEST_TIMEOUT_SECONDS = 15
 
 # 以 68 点中的眉毛、下颌轮廓为基准，供检测失败时的矩形裁剪回退使用。
 FACE_CROP_SIDE_MARGIN = 0.04
@@ -1661,6 +1696,148 @@ def delete_participant_faces():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+def _sona_xml_element(root, local_name):
+    """忽略 XML 命名空间查找 SONA 响应字段。"""
+    for element in root.iter():
+        if element.tag.rsplit('}', 1)[-1] == local_name:
+            return element
+    return None
+
+
+def _parse_sona_credit_response(response_text):
+    """解析 WebstudyCredit XML，并将重复授予视为幂等成功。"""
+    normalized_text = (response_text or '').strip()
+    lower_text = normalized_text.lower()
+    already_granted_phrases = (
+        'already received credit',
+        'already participated',
+        'credit has already been granted'
+    )
+    if any(phrase in lower_text for phrase in already_granted_phrases):
+        return {
+            'success': True,
+            'status': 'already_granted',
+            'message': 'SONA credit had already been granted.'
+        }
+
+    try:
+        root = ET.fromstring(normalized_text)
+    except ET.ParseError:
+        return {
+            'success': False,
+            'status': 'invalid_response',
+            'message': 'SONA returned an invalid XML response.'
+        }
+
+    result_element = _sona_xml_element(root, 'Result')
+    credit_status_element = _sona_xml_element(root, 'credit_status')
+    credit_status = (
+        (credit_status_element.text or '').strip()
+        if credit_status_element is not None
+        else ''
+    )
+    if result_element is not None and (credit_status == 'G' or not credit_status):
+        return {
+            'success': True,
+            'status': 'granted',
+            'credit_status': credit_status or 'G',
+            'message': 'SONA credit was granted successfully.'
+        }
+
+    error_messages = []
+    errors_element = _sona_xml_element(root, 'Errors')
+    if errors_element is not None:
+        for element in errors_element.iter():
+            text = (element.text or '').strip()
+            if text and text not in error_messages:
+                error_messages.append(text)
+
+    return {
+        'success': False,
+        'status': 'rejected',
+        'message': '; '.join(error_messages) or 'SONA did not confirm that credit was granted.'
+    }
+
+
+def grant_sona_credit(survey_code):
+    """通过 SONA Server-Side Completion URL 授予参与 credit。"""
+    survey_code = str(survey_code or '').strip()
+    if not survey_code:
+        return {
+            'success': False,
+            'status': 'missing_survey_code',
+            'message': 'The SONA survey code is missing from the experiment URL.'
+        }
+    if not re.fullmatch(r'^[A-Za-z0-9._-]{1,128}$', survey_code):
+        return {
+            'success': False,
+            'status': 'invalid_survey_code',
+            'message': 'The SONA survey code has an invalid format.'
+        }
+    if not SONA_CREDIT_TOKEN:
+        return {
+            'success': False,
+            'status': 'configuration_error',
+            'message': 'The backend SONA_CREDIT_TOKEN environment variable is not configured.'
+        }
+
+    query = urllib.parse.urlencode({
+        'experiment_id': SONA_EXPERIMENT_ID,
+        'credit_token': SONA_CREDIT_TOKEN,
+        'survey_code': survey_code
+    })
+    completion_url = f"{SONA_COMPLETION_API_URL}?{query}"
+    sona_request = urllib.request.Request(
+        completion_url,
+        method='GET',
+        headers={
+            'Accept': 'application/xml, text/xml',
+            'User-Agent': 'Bristol-Face-Experiment/1.0'
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(
+            sona_request,
+            timeout=SONA_REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            response_text = response.read().decode('utf-8', errors='replace')
+        return _parse_sona_credit_response(response_text)
+    except urllib.error.HTTPError as error:
+        response_text = error.read().decode('utf-8', errors='replace')
+        parsed_response = _parse_sona_credit_response(response_text)
+        if parsed_response.get('success'):
+            return parsed_response
+        parsed_response['message'] = (
+            f"SONA returned HTTP {error.code}: {parsed_response.get('message')}"
+        )
+        return parsed_response
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return {
+            'success': False,
+            'status': 'connection_error',
+            'message': f"Could not contact SONA: {error}"
+        }
+
+
+def _write_json_atomically(json_filepath, data):
+    """在同一目录写临时文件后原子替换正式 JSON。调用方负责加锁。"""
+    json_filename = os.path.basename(json_filepath)
+    json_temp_path = os.path.join(
+        DATA_SAVE_PATH,
+        f".{json_filename}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(json_temp_path, 'w', encoding='utf-8') as temp_file:
+            json.dump(data, temp_file, ensure_ascii=False, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(json_temp_path, json_filepath)
+    finally:
+        if os.path.exists(json_temp_path):
+            os.remove(json_temp_path)
+
 # --- 核心路由: 数据保存 ---
 @app.route('/save_data', methods=['POST'])
 def save_data():
@@ -1683,7 +1860,6 @@ def save_data():
         # 1. JSON 是最终数据的主记录。采用锁和原子替换，避免自动保存与最终保存并发写坏文件。
         json_filename = f"experiment_data_{participant_id}.json"
         json_filepath = os.path.join(DATA_SAVE_PATH, json_filename)
-        json_temp_path = None
         with DATA_SAVE_LOCK:
             existing_data = None
             if os.path.isfile(json_filepath):
@@ -1693,6 +1869,17 @@ def save_data():
                 except (OSError, ValueError):
                     existing_data = None
 
+            # 如果上一次最终请求已经成功授予 credit，重试时直接复用结果，
+            # 避免因前端未收到响应而重复请求 SONA。
+            if is_complete and isinstance(existing_data, dict):
+                existing_sona = existing_data.get('sona_completion', {})
+                if (
+                    existing_sona.get('success') is True and
+                    str(existing_data.get('sona_id', '')).strip() ==
+                    str(data.get('sona_id', '')).strip()
+                ):
+                    data['sona_completion'] = existing_sona
+
             # 已经完成的记录不能被稍后到达的旧自动保存请求降级覆盖。
             preserve_completed_record = (
                 isinstance(existing_data, dict) and
@@ -1701,19 +1888,19 @@ def save_data():
             )
 
             if not preserve_completed_record:
-                json_temp_path = os.path.join(
-                    DATA_SAVE_PATH,
-                    f".{json_filename}.{uuid.uuid4().hex}.tmp"
-                )
-                try:
-                    with open(json_temp_path, 'w', encoding='utf-8') as temp_file:
-                        json.dump(data, temp_file, ensure_ascii=False, indent=2)
-                        temp_file.flush()
-                        os.fsync(temp_file.fileno())
-                    os.replace(json_temp_path, json_filepath)
-                finally:
-                    if json_temp_path and os.path.exists(json_temp_path):
-                        os.remove(json_temp_path)
+                _write_json_atomically(json_filepath, data)
+
+        sona_completion = data.get('sona_completion')
+        if is_complete and not (
+            isinstance(sona_completion, dict) and
+            sona_completion.get('success') is True
+        ):
+            sona_completion = grant_sona_credit(data.get('sona_id'))
+            sona_completion['attempted_at'] = datetime.now().isoformat()
+            data['sona_completion'] = sona_completion
+            # 无论成功或失败都记录结果，便于审计，并允许下次点击继续重试。
+            with DATA_SAVE_LOCK:
+                _write_json_atomically(json_filepath, data)
 
         excel_saved = None
         excel_destination = None
@@ -1734,6 +1921,21 @@ def save_data():
                 'Self_Gender': data.get('gender_info', {}).get('self'),
                 'Partner_Gender': data.get('gender_info', {}).get('partner'),
                 'User_Profile_Text': data.get('user_profile'),
+                'SONA_Completion_Status': (
+                    sona_completion.get('status', '')
+                    if isinstance(sona_completion, dict)
+                    else ''
+                ),
+                'SONA_Credit_Granted': (
+                    sona_completion.get('success', '')
+                    if isinstance(sona_completion, dict)
+                    else ''
+                ),
+                'SONA_Completion_Message': (
+                    sona_completion.get('message', '')
+                    if isinstance(sona_completion, dict)
+                    else ''
+                ),
                 'Mode': data.get('mode'),
                 'Is_Complete': is_complete
             }
@@ -1820,6 +2022,15 @@ def save_data():
         }
         if excel_warning:
             response_body["warning"] = excel_warning
+        if is_complete:
+            response_body["sona_completion"] = sona_completion
+            if not sona_completion.get('success'):
+                response_body["status"] = "data_saved_sona_pending"
+                response_body["error"] = (
+                    "Experiment data was saved, but SONA completion failed: "
+                    + sona_completion.get('message', 'Unknown SONA error')
+                )
+                return jsonify(response_body), 502
         return jsonify(response_body)
     except Exception as e:
         traceback.print_exc()
