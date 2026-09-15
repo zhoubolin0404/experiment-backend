@@ -1728,6 +1728,7 @@ def save_data():
             # --- 构建数据行 ---
             common_info = {
                 'Participant_ID': participant_id,
+                'SONA_ID': data.get('sona_id', ''),
                 'Timestamp': data.get('timestamp', datetime.now().isoformat()),
                 'Condition_Group': data.get('condition_group'),
                 'Self_Gender': data.get('gender_info', {}).get('self'),
