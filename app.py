@@ -105,6 +105,12 @@ FACE_BOUNDARY_POINT_START = (
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
 FACE_ALIGN_RIGHT_EYE = (0.66, 0.40)
 FACE_ALIGN_MOUTH = (0.50, 0.69)
+# AFA 默认使用眉、眼、鼻和外唇进行广义 Procrustes 对齐，排除较不稳定的
+# 下颌线与内唇。实现依据 Gaspar & Garrod (2025), DOI: 10.5334/jors.542，
+# 并针对本项目的内存图像管线重写，不依赖 AFA 的文件夹式批处理接口。
+AFA_ALIGNMENT_LANDMARK_INDICES = np.arange(17, 60, dtype=np.int32)
+AFA_GPA_MAX_ITERATIONS = 64
+AFA_GPA_TOLERANCE = 1e-7
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -162,6 +168,157 @@ def get_points(image):
     except Exception as e:
         print(f"Error in get_points: {e}")
         return np.array([])
+
+
+def _normalize_landmark_shape(points, fit_indices):
+    """按 AFA/GPA 约定平移到原点并统一形状尺度。"""
+    shape = np.asarray(points, dtype=np.float64)
+    fit_points = shape[fit_indices]
+    center = np.mean(fit_points, axis=0)
+    centered = shape - center
+    shape_norm = float(np.linalg.norm(centered[fit_indices]))
+    if not np.isfinite(shape_norm) or shape_norm <= 1e-8:
+        raise ValueError("Face landmarks have an invalid Procrustes scale.")
+    return centered / shape_norm
+
+
+def _orthogonal_procrustes_rotation(source, target):
+    """返回将行向量 source 最小二乘旋转到 target 的无反射矩阵。"""
+    covariance = np.asarray(source, dtype=np.float64).T @ np.asarray(
+        target,
+        dtype=np.float64
+    )
+    u_matrix, _, vt_matrix = np.linalg.svd(covariance)
+    correction = np.eye(2, dtype=np.float64)
+    if np.linalg.det(u_matrix @ vt_matrix) < 0:
+        correction[-1, -1] = -1.0
+    return u_matrix @ correction @ vt_matrix
+
+
+def _estimate_similarity_transform(source_points, target_points):
+    """以全部给定控制点估计无反射、各向同性的相似变换。"""
+    source = np.asarray(source_points, dtype=np.float64)
+    target = np.asarray(target_points, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 2:
+        raise ValueError("Source and target landmarks must have matching Nx2 shapes.")
+
+    source_center = np.mean(source, axis=0)
+    target_center = np.mean(target, axis=0)
+    source_centered = source - source_center
+    target_centered = target - target_center
+    denominator = float(np.sum(source_centered * source_centered))
+    if not np.isfinite(denominator) or denominator <= 1e-8:
+        raise ValueError("Cannot estimate a transform from degenerate landmarks.")
+
+    rotation = _orthogonal_procrustes_rotation(
+        source_centered,
+        target_centered
+    )
+    rotated_source = source_centered @ rotation
+    scale = float(
+        np.sum(rotated_source * target_centered) / denominator
+    )
+    if not np.isfinite(scale) or scale <= 1e-8:
+        raise ValueError("Estimated face-alignment scale is invalid.")
+
+    translation = target_center - scale * (source_center @ rotation)
+    linear = (scale * rotation).T
+    return np.column_stack([linear, translation]).astype(np.float32)
+
+
+def _transform_landmarks(points, transform):
+    """将 OpenCV 2x3 仿射矩阵应用到任意数量的二维关键点。"""
+    landmarks = np.asarray(points, dtype=np.float32)
+    return (
+        landmarks @ transform[:, :2].T + transform[:, 2]
+    ).astype(np.float32)
+
+
+def build_afa_reference_shape(landmark_sets, output_width, output_height):
+    """对同一刺激组执行 GPA，并把共识形状放入统一实验画布。"""
+    shapes = [
+        np.asarray(points[:68], dtype=np.float64)
+        for points in landmark_sets
+        if points is not None and len(points) >= 68
+    ]
+    if len(shapes) != len(landmark_sets) or len(shapes) < 2:
+        raise ValueError("AFA alignment requires at least two valid 68-point faces.")
+
+    fit_indices = AFA_ALIGNMENT_LANDMARK_INDICES
+    normalized_shapes = [
+        _normalize_landmark_shape(shape, fit_indices)
+        for shape in shapes
+    ]
+    reference = normalized_shapes[0][fit_indices]
+    mean_shape = normalized_shapes[0]
+
+    for _ in range(AFA_GPA_MAX_ITERATIONS):
+        aligned_shapes = []
+        for shape in normalized_shapes:
+            rotation = _orthogonal_procrustes_rotation(
+                shape[fit_indices],
+                reference
+            )
+            aligned_shapes.append(shape @ rotation)
+
+        candidate = np.mean(aligned_shapes, axis=0)
+        candidate = _normalize_landmark_shape(candidate, fit_indices)
+        next_reference = candidate[fit_indices]
+        change = float(np.linalg.norm(next_reference - reference))
+        mean_shape = candidate
+        reference = next_reference
+        if change <= AFA_GPA_TOLERANCE:
+            break
+
+    source_anchors = np.float32([
+        np.mean(mean_shape[36:42], axis=0),
+        np.mean(mean_shape[42:48], axis=0),
+        (mean_shape[48] + mean_shape[54]) / 2.0
+    ])
+    destination_anchors = np.float32([
+        [FACE_ALIGN_LEFT_EYE[0] * output_width,
+         FACE_ALIGN_LEFT_EYE[1] * output_height],
+        [FACE_ALIGN_RIGHT_EYE[0] * output_width,
+         FACE_ALIGN_RIGHT_EYE[1] * output_height],
+        [FACE_ALIGN_MOUTH[0] * output_width,
+         FACE_ALIGN_MOUTH[1] * output_height]
+    ])
+    canvas_transform = _estimate_similarity_transform(
+        source_anchors,
+        destination_anchors
+    )
+    return _transform_landmarks(mean_shape, canvas_transform)
+
+
+def align_face_collection_afa(images, landmark_sets):
+    """按 AFA 流程把一组人脸对齐到同一个 GPA 共识形状。"""
+    if len(images) != len(landmark_sets):
+        raise ValueError("Images and landmark sets must have the same length.")
+
+    reference_shape = build_afa_reference_shape(
+        landmark_sets,
+        PROCESS_WIDTH,
+        PROCESS_HEIGHT
+    )
+    fit_indices = AFA_ALIGNMENT_LANDMARK_INDICES
+    aligned_faces = []
+    for image, landmarks in zip(images, landmark_sets):
+        face_points = np.asarray(landmarks[:68], dtype=np.float32)
+        transform = _estimate_similarity_transform(
+            face_points[fit_indices],
+            reference_shape[fit_indices]
+        )
+        aligned_image = cv2.warpAffine(
+            image,
+            transform,
+            (PROCESS_WIDTH, PROCESS_HEIGHT),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(FACE_CANVAS_VALUE,) * 3
+        )
+        aligned_points = _transform_landmarks(face_points, transform)
+        aligned_faces.append((aligned_image, aligned_points))
+    return aligned_faces
 
 def get_triangles(points):
     try:
@@ -1087,11 +1244,16 @@ def morph_faces_full(
     face_mask2=None,
     subject_blur_sigma=0.0
 ):
-    """使用提供文件中的全图 Delaunay 三角形仿射与线性融合策略。"""
+    """在 AFA 对齐结果上融合形状与纹理，并保留数据库头发和背景。"""
     try:
         img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
         img2_arr = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        img1 = np.copy(img1_arr)
+        subject_ratio = 1.0 - float(alpha)
+        img1 = soften_subject_for_morph(
+            np.copy(img1_arr),
+            subject_blur_sigma,
+            subject_ratio
+        )
         img2 = np.copy(img2_arr)
 
         if points1 is None:
@@ -1102,21 +1264,41 @@ def morph_faces_full(
         points1 = np.asarray(points1, dtype=np.float32)
         points2 = np.asarray(points2, dtype=np.float32)
 
-        # 当前样本筛选仍可保留扩展额头网格；实际融合严格取提供文件使用的
-        # 68 个面部点和 8 个画布边界点。
-        if len(points1) > 76:
-            points1 = np.concatenate((points1[:68], points1[-8:]), axis=0)
-        if len(points2) > 76:
-            points2 = np.concatenate((points2[:68], points2[-8:]), axis=0)
-
         if len(points1) == 0 or len(points2) == 0 or len(points1) != len(points2):
             return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
 
-        points_avg = (1 - alpha) * points1 + alpha * points2
+        # AFA 的核心做法是对关键点形状与图像纹理使用同一权重。项目额外
+        # 固定数据库发际线、下颌和画布边界，使头发、耳朵及背景不产生重影。
+        points_avg = interpolate_face_geometry(points1, points2, alpha)
         triangles = get_triangles(points_avg)
+        if len(triangles) == 0:
+            return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
+
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
-        final_img = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
+
+        warped_mask1 = warp_face_mask(
+            face_mask1,
+            points1,
+            points_avg,
+            triangles
+        )
+        warped_mask2 = warp_face_mask(
+            face_mask2,
+            points2,
+            points_avg,
+            triangles
+        )
+        final_img = blend_face_without_hair_ghosting(
+            warp1,
+            warp2,
+            points_avg,
+            alpha,
+            database_base=img2,
+            database_base_mask=face_mask2,
+            warped_mask1=warped_mask1,
+            warped_mask2=warped_mask2
+        )
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
@@ -1375,7 +1557,7 @@ def save_uploaded_image(image, photo_batch_id, role):
 
 @lru_cache(maxsize=256)
 def load_prepared_db_image(filepath):
-    """缓存样本库的规范矩形头像、融合网格与可见面部掩膜。"""
+    """缓存样本库头像、原始68点、扩展网格与可见面部掩膜。"""
     img = cv2.imread(filepath)
     if img is None:
         raise ValueError(f"Cannot read database image: {filepath}")
@@ -1389,7 +1571,7 @@ def load_prepared_db_image(filepath):
         raise ValueError(
             f"Database face quality rejected: {quality_issue}"
         )
-    return img_resized, points, face_mask
+    return img_resized, detected_points[:68], points, face_mask
 
 def get_random_original_db_images(gender, count=3, excluded_filenames=None):
     """随机选取指定数量的不重复同性数据库面孔，并完成裁剪和关键点预处理。"""
@@ -1416,7 +1598,12 @@ def get_random_original_db_images(gender, count=3, excluded_filenames=None):
     selected_images = []
     for selected_file in candidates:
         try:
-            img_resized, points, face_mask = load_prepared_db_image(selected_file)
+            (
+                img_resized,
+                detected_points,
+                points,
+                face_mask
+            ) = load_prepared_db_image(selected_file)
             if (
                 len(points) >= FACE_BOUNDARY_POINT_START and
                 face_mask is not None
@@ -1425,6 +1612,7 @@ def get_random_original_db_images(gender, count=3, excluded_filenames=None):
                     (
                         img_resized,
                         os.path.basename(selected_file),
+                        detected_points,
                         points,
                         face_mask
                     )
@@ -1437,6 +1625,73 @@ def get_random_original_db_images(gender, count=3, excluded_filenames=None):
             )
             continue
     return selected_images
+
+
+def align_afa_stimulus_group(
+    subject_image,
+    subject_detected_points,
+    database_faces
+):
+    """以被试和其3张样本脸共同建立AFA/GPA参考形状并完成对齐。"""
+    images = [subject_image] + [entry[0] for entry in database_faces]
+    landmark_sets = [
+        np.asarray(subject_detected_points[:68], dtype=np.float32)
+    ] + [
+        np.asarray(entry[2][:68], dtype=np.float32)
+        for entry in database_faces
+    ]
+    aligned_records = align_face_collection_afa(images, landmark_sets)
+
+    aligned_subject_image, aligned_subject_detected = aligned_records[0]
+    subject_points, subject_mask = prepare_face_geometry(
+        aligned_subject_image,
+        aligned_subject_detected
+    )
+    if (
+        len(subject_points) < FACE_BOUNDARY_POINT_START or
+        subject_mask is None
+    ):
+        raise ValueError("AFA could not prepare the aligned participant face.")
+
+    aligned_database_faces = []
+    for aligned_record, database_entry in zip(
+        aligned_records[1:],
+        database_faces
+    ):
+        aligned_image, aligned_detected = aligned_record
+        database_filename = database_entry[1]
+        database_points, database_mask = prepare_face_geometry(
+            aligned_image,
+            aligned_detected
+        )
+        if (
+            len(database_points) < FACE_BOUNDARY_POINT_START or
+            database_mask is None
+        ):
+            raise ValueError(
+                f"AFA could not prepare database face: {database_filename}"
+            )
+        quality_issue = database_face_quality_issue(
+            aligned_image,
+            database_mask
+        )
+        if quality_issue:
+            raise ValueError(
+                f"Aligned database face rejected ({database_filename}): "
+                f"{quality_issue}"
+            )
+        aligned_database_faces.append((
+            aligned_image,
+            database_filename,
+            database_points,
+            database_mask
+        ))
+
+    return (
+        aligned_subject_image,
+        subject_points,
+        subject_mask
+    ), aligned_database_faces
 
 def base64_to_cv2(base64_string):
     try:
@@ -1457,7 +1712,7 @@ def cv2_to_base64(img_arr):
         return ""
 
 def build_morph_stimulus(job):
-    """按提供文件的三角形仿射算法生成单张刺激图。"""
+    """在AFA规范对齐后生成单张形状与纹理融合刺激图。"""
     ratio = job["ratio"]
     alpha = 1.0 - ratio
 
@@ -1474,7 +1729,10 @@ def build_morph_stimulus(job):
             job["database_image"],
             alpha,
             points1=job["subject_points"],
-            points2=job["database_points"]
+            points2=job["database_points"],
+            face_mask1=job["subject_mask"],
+            face_mask2=job["database_mask"],
+            subject_blur_sigma=job["subject_blur_sigma"]
         )
 
     final_face = crop_face_tight(morphed_full, avg_points)
@@ -1566,9 +1824,6 @@ def process_images_experiment():
                 "code": "FACE_EXPOSURE_ERROR"
             }), 422
 
-        # 双眼与嘴部已经被规范到同一坐标系。直接保留矩形头像内的头发、
-        # 耳朵和原背景，不再做人像抠图或下颌镂空。
-
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
         partner_filename = save_uploaded_image(img_partner_wide, photo_batch_id, "partner")
@@ -1583,7 +1838,7 @@ def process_images_experiment():
         # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
         self_db_faces = get_random_original_db_images(self_gender, count=3)
         partner_excluded_filenames = (
-            {db_filename for _, db_filename, _, _ in self_db_faces}
+            {db_filename for _, db_filename, _, _, _ in self_db_faces}
             if self_gender == partner_gender
             else set()
         )
@@ -1598,10 +1853,30 @@ def process_images_experiment():
                 "code": "INSUFFICIENT_DATABASE_FACES"
             }), 500
 
+        # AFA 的 GPA 必须在同一刺激集合上计算共识形状。本人组和伴侣组
+        # 各自由“上传脸 + 3张固定数据库脸”建立一次参考形状；同一组的
+        # 六个比例共享完全相同的对齐图、关键点和遮罩。
+        (
+            (img_self_aligned, self_points, self_face_mask),
+            self_db_faces
+        ) = align_afa_stimulus_group(
+            img_self_wide,
+            self_detected_points,
+            self_db_faces
+        )
+        (
+            (img_partner_aligned, partner_points, partner_face_mask),
+            partner_db_faces
+        ) = align_afa_stimulus_group(
+            img_partner_wide,
+            partner_detected_points,
+            partner_db_faces
+        )
+
         # 1. Self Morphs: 3 database identities × 6 ratios = 18 images
         for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(self_db_faces, start=1):
             subject_blur_sigma = estimate_subject_blur_sigma(
-                img_self_wide,
+                img_self_aligned,
                 db_img,
                 self_face_mask,
                 db_mask
@@ -1609,7 +1884,7 @@ def process_images_experiment():
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
-                    "subject_image": img_self_wide,
+                    "subject_image": img_self_aligned,
                     "subject_points": self_points,
                     "subject_mask": self_face_mask,
                     "database_image": db_img,
@@ -1628,7 +1903,7 @@ def process_images_experiment():
         # 2. Partner Morphs: 3 database identities × 6 ratios = 18 images
         for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(partner_db_faces, start=1):
             subject_blur_sigma = estimate_subject_blur_sigma(
-                img_partner_wide,
+                img_partner_aligned,
                 db_img,
                 partner_face_mask,
                 db_mask
@@ -1636,7 +1911,7 @@ def process_images_experiment():
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
-                    "subject_image": img_partner_wide,
+                    "subject_image": img_partner_aligned,
                     "subject_points": partner_points,
                     "subject_mask": partner_face_mask,
                     "database_image": db_img,
