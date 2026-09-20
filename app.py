@@ -320,6 +320,22 @@ def align_face_collection_afa(images, landmark_sets):
         aligned_faces.append((aligned_image, aligned_points))
     return aligned_faces
 
+
+def add_canvas_boundary_points(landmarks, image_shape):
+    """为AFA对齐后的68点增加原算法使用的8个整图边界控制点。"""
+    face_points = np.asarray(landmarks[:68], dtype=np.float32)
+    if len(face_points) < 68:
+        return np.array([])
+    height, width = image_shape[:2]
+    x_max = width - 1
+    y_max = height - 1
+    boundary_points = np.float32([
+        [0, 0], [x_max // 2, 0], [x_max, 0],
+        [x_max, y_max // 2], [x_max, y_max], [x_max // 2, y_max],
+        [0, y_max], [0, y_max // 2]
+    ])
+    return np.vstack([face_points, boundary_points])
+
 def get_triangles(points):
     try:
         return Delaunay(points).simplices
@@ -1239,21 +1255,13 @@ def morph_faces_full(
     img2_arr,
     alpha=0.5,
     points1=None,
-    points2=None,
-    face_mask1=None,
-    face_mask2=None,
-    subject_blur_sigma=0.0
+    points2=None
 ):
-    """在 AFA 对齐结果上融合形状与纹理，并保留数据库头发和背景。"""
+    """在AFA对齐结果上沿用原整图Delaunay形变与线性融合策略。"""
     try:
         img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
         img2_arr = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        subject_ratio = 1.0 - float(alpha)
-        img1 = soften_subject_for_morph(
-            np.copy(img1_arr),
-            subject_blur_sigma,
-            subject_ratio
-        )
+        img1 = np.copy(img1_arr)
         img2 = np.copy(img2_arr)
 
         if points1 is None:
@@ -1264,41 +1272,21 @@ def morph_faces_full(
         points1 = np.asarray(points1, dtype=np.float32)
         points2 = np.asarray(points2, dtype=np.float32)
 
+        # 原算法只使用68个人脸点和8个画布边界点。画布边界参与三角剖分，
+        # 因此两张图的头发、耳朵和背景都会随比例共同形变并线性混合。
+        if len(points1) > 76:
+            points1 = np.concatenate((points1[:68], points1[-8:]), axis=0)
+        if len(points2) > 76:
+            points2 = np.concatenate((points2[:68], points2[-8:]), axis=0)
+
         if len(points1) == 0 or len(points2) == 0 or len(points1) != len(points2):
             return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
 
-        # AFA 的核心做法是对关键点形状与图像纹理使用同一权重。项目额外
-        # 固定数据库发际线、下颌和画布边界，使头发、耳朵及背景不产生重影。
-        points_avg = interpolate_face_geometry(points1, points2, alpha)
+        points_avg = (1 - alpha) * points1 + alpha * points2
         triangles = get_triangles(points_avg)
-        if len(triangles) == 0:
-            return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
-
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
-
-        warped_mask1 = warp_face_mask(
-            face_mask1,
-            points1,
-            points_avg,
-            triangles
-        )
-        warped_mask2 = warp_face_mask(
-            face_mask2,
-            points2,
-            points_avg,
-            triangles
-        )
-        final_img = blend_face_without_hair_ghosting(
-            warp1,
-            warp2,
-            points_avg,
-            alpha,
-            database_base=img2,
-            database_base_mask=face_mask2,
-            warped_mask1=warped_mask1,
-            warped_mask2=warped_mask2
-        )
+        final_img = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
         return final_img, points_avg
     except Exception as e:
         print(f"Morphing error: {e}")
@@ -1557,7 +1545,7 @@ def save_uploaded_image(image, photo_batch_id, role):
 
 @lru_cache(maxsize=256)
 def load_prepared_db_image(filepath):
-    """缓存样本库头像、原始68点、扩展网格与可见面部掩膜。"""
+    """缓存样本库规范头像及AFA需要的68个人脸关键点。"""
     img = cv2.imread(filepath)
     if img is None:
         raise ValueError(f"Cannot read database image: {filepath}")
@@ -1565,13 +1553,9 @@ def load_prepared_db_image(filepath):
     if img_resized is None:
         img_resized = cv2.resize(img, (PROCESS_WIDTH, PROCESS_HEIGHT))
     detected_points = get_points(img_resized)
-    points, face_mask = prepare_face_geometry(img_resized, detected_points)
-    quality_issue = database_face_quality_issue(img_resized, face_mask)
-    if quality_issue:
-        raise ValueError(
-            f"Database face quality rejected: {quality_issue}"
-        )
-    return img_resized, detected_points[:68], points, face_mask
+    if len(detected_points) < 68:
+        raise ValueError("A clear face could not be detected in database image.")
+    return img_resized, detected_points[:68]
 
 def get_random_original_db_images(gender, count=3, excluded_filenames=None):
     """随机选取指定数量的不重复同性数据库面孔，并完成裁剪和关键点预处理。"""
@@ -1598,27 +1582,16 @@ def get_random_original_db_images(gender, count=3, excluded_filenames=None):
     selected_images = []
     for selected_file in candidates:
         try:
-            (
+            img_resized, detected_points = load_prepared_db_image(
+                selected_file
+            )
+            selected_images.append((
                 img_resized,
-                detected_points,
-                points,
-                face_mask
-            ) = load_prepared_db_image(selected_file)
-            if (
-                len(points) >= FACE_BOUNDARY_POINT_START and
-                face_mask is not None
-            ):
-                selected_images.append(
-                    (
-                        img_resized,
-                        os.path.basename(selected_file),
-                        detected_points,
-                        points,
-                        face_mask
-                    )
-                )
-                if len(selected_images) == count:
-                    break
+                os.path.basename(selected_file),
+                detected_points
+            ))
+            if len(selected_images) == count:
+                break
         except Exception as e:
             print(
                 f"Skipping database face {os.path.basename(selected_file)}: {e}"
@@ -1643,14 +1616,11 @@ def align_afa_stimulus_group(
     aligned_records = align_face_collection_afa(images, landmark_sets)
 
     aligned_subject_image, aligned_subject_detected = aligned_records[0]
-    subject_points, subject_mask = prepare_face_geometry(
-        aligned_subject_image,
-        aligned_subject_detected
+    subject_points = add_canvas_boundary_points(
+        aligned_subject_detected,
+        aligned_subject_image.shape
     )
-    if (
-        len(subject_points) < FACE_BOUNDARY_POINT_START or
-        subject_mask is None
-    ):
+    if len(subject_points) != 76:
         raise ValueError("AFA could not prepare the aligned participant face.")
 
     aligned_database_faces = []
@@ -1660,37 +1630,23 @@ def align_afa_stimulus_group(
     ):
         aligned_image, aligned_detected = aligned_record
         database_filename = database_entry[1]
-        database_points, database_mask = prepare_face_geometry(
-            aligned_image,
-            aligned_detected
+        database_points = add_canvas_boundary_points(
+            aligned_detected,
+            aligned_image.shape
         )
-        if (
-            len(database_points) < FACE_BOUNDARY_POINT_START or
-            database_mask is None
-        ):
+        if len(database_points) != 76:
             raise ValueError(
                 f"AFA could not prepare database face: {database_filename}"
-            )
-        quality_issue = database_face_quality_issue(
-            aligned_image,
-            database_mask
-        )
-        if quality_issue:
-            raise ValueError(
-                f"Aligned database face rejected ({database_filename}): "
-                f"{quality_issue}"
             )
         aligned_database_faces.append((
             aligned_image,
             database_filename,
-            database_points,
-            database_mask
+            database_points
         ))
 
     return (
         aligned_subject_image,
-        subject_points,
-        subject_mask
+        subject_points
     ), aligned_database_faces
 
 def base64_to_cv2(base64_string):
@@ -1712,7 +1668,7 @@ def cv2_to_base64(img_arr):
         return ""
 
 def build_morph_stimulus(job):
-    """在AFA规范对齐后生成单张形状与纹理融合刺激图。"""
+    """在AFA规范对齐后使用原整图算法生成单张融合刺激图。"""
     ratio = job["ratio"]
     alpha = 1.0 - ratio
 
@@ -1729,10 +1685,7 @@ def build_morph_stimulus(job):
             job["database_image"],
             alpha,
             points1=job["subject_points"],
-            points2=job["database_points"],
-            face_mask1=job["subject_mask"],
-            face_mask2=job["database_mask"],
-            subject_blur_sigma=job["subject_blur_sigma"]
+            points2=job["database_points"]
         )
 
     final_face = crop_face_tight(morphed_full, avg_points)
@@ -1785,45 +1738,6 @@ def process_images_experiment():
                 "code": "FACE_QUALITY_ERROR"
             }), 422
 
-        # 每张上传照片独立估计实际可见额头，并将曲线加入三角形变网格。
-        self_points, self_face_mask = prepare_face_geometry(
-            img_self_wide,
-            self_detected_points
-        )
-        partner_points, partner_face_mask = prepare_face_geometry(
-            img_partner_wide,
-            partner_detected_points
-        )
-        if (
-            len(self_points) < FACE_BOUNDARY_POINT_START or
-            len(partner_points) < FACE_BOUNDARY_POINT_START
-        ):
-            return jsonify({
-                "error": "The visible face boundary could not be estimated reliably. Please use an evenly lit, front-facing photograph.",
-                "code": "FACE_BOUNDARY_ERROR"
-            }), 422
-
-        quality_errors = []
-        self_quality_issue = database_face_quality_issue(
-            img_self_wide,
-            self_face_mask
-        )
-        partner_quality_issue = database_face_quality_issue(
-            img_partner_wide,
-            partner_face_mask
-        )
-        if self_quality_issue:
-            quality_errors.append(f"your photograph: {self_quality_issue}")
-        if partner_quality_issue:
-            quality_errors.append(
-                f"your partner's photograph: {partner_quality_issue}"
-            )
-        if quality_errors:
-            return jsonify({
-                "error": "Photo quality is unsuitable: " + "; ".join(quality_errors),
-                "code": "FACE_EXPOSURE_ERROR"
-            }), 422
-
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
         partner_filename = save_uploaded_image(img_partner_wide, photo_batch_id, "partner")
@@ -1838,7 +1752,7 @@ def process_images_experiment():
         # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
         self_db_faces = get_random_original_db_images(self_gender, count=3)
         partner_excluded_filenames = (
-            {db_filename for _, db_filename, _, _, _ in self_db_faces}
+            {db_filename for _, db_filename, _ in self_db_faces}
             if self_gender == partner_gender
             else set()
         )
@@ -1855,9 +1769,9 @@ def process_images_experiment():
 
         # AFA 的 GPA 必须在同一刺激集合上计算共识形状。本人组和伴侣组
         # 各自由“上传脸 + 3张固定数据库脸”建立一次参考形状；同一组的
-        # 六个比例共享完全相同的对齐图、关键点和遮罩。
+        # 六个比例共享完全相同的对齐图与关键点。
         (
-            (img_self_aligned, self_points, self_face_mask),
+            (img_self_aligned, self_points),
             self_db_faces
         ) = align_afa_stimulus_group(
             img_self_wide,
@@ -1865,7 +1779,7 @@ def process_images_experiment():
             self_db_faces
         )
         (
-            (img_partner_aligned, partner_points, partner_face_mask),
+            (img_partner_aligned, partner_points),
             partner_db_faces
         ) = align_afa_stimulus_group(
             img_partner_wide,
@@ -1874,23 +1788,14 @@ def process_images_experiment():
         )
 
         # 1. Self Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(self_db_faces, start=1):
-            subject_blur_sigma = estimate_subject_blur_sigma(
-                img_self_aligned,
-                db_img,
-                self_face_mask,
-                db_mask
-            )
+        for db_index, (db_img, db_filename, db_points) in enumerate(self_db_faces, start=1):
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
                     "subject_image": img_self_aligned,
                     "subject_points": self_points,
-                    "subject_mask": self_face_mask,
                     "database_image": db_img,
                     "database_points": db_points,
-                    "database_mask": db_mask,
-                    "subject_blur_sigma": subject_blur_sigma,
                     "ratio": ratio,
                     "ratio_key": "ratio_self",
                     "stimulus_type": "self_morph",
@@ -1901,23 +1806,14 @@ def process_images_experiment():
                 trial_id += 1
 
         # 2. Partner Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points, db_mask) in enumerate(partner_db_faces, start=1):
-            subject_blur_sigma = estimate_subject_blur_sigma(
-                img_partner_aligned,
-                db_img,
-                partner_face_mask,
-                db_mask
-            )
+        for db_index, (db_img, db_filename, db_points) in enumerate(partner_db_faces, start=1):
             for ratio in ratios:
                 morph_jobs.append({
                     "trial_id": trial_id,
                     "subject_image": img_partner_aligned,
                     "subject_points": partner_points,
-                    "subject_mask": partner_face_mask,
                     "database_image": db_img,
                     "database_points": db_points,
-                    "database_mask": db_mask,
-                    "subject_blur_sigma": subject_blur_sigma,
                     "ratio": ratio,
                     "ratio_key": "ratio_partner",
                     "stimulus_type": "partner_morph",
