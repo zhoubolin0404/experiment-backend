@@ -111,6 +111,18 @@ FACE_ALIGN_MOUTH = (0.50, 0.69)
 AFA_ALIGNMENT_LANDMARK_INDICES = np.arange(17, 60, dtype=np.int32)
 AFA_GPA_MAX_ITERATIONS = 64
 AFA_GPA_TOLERANCE = 1e-7
+# 外轮廓点只作为Delaunay控制点，不作为最终合成遮罩。固定角度与固定
+# 颈肩高度确保两张不同人像之间始终存在一一对应的轮廓点。
+OUTER_HEAD_ANGLE_DEGREES = np.linspace(170.0, 370.0, 29, dtype=np.float32)
+OUTER_SHOULDER_LEVEL_FRACTIONS = (0.16, 0.34, 0.54, 0.74)
+OUTER_CONTOUR_POINT_COUNT = (
+    len(OUTER_HEAD_ANGLE_DEGREES) +
+    2 * len(OUTER_SHOULDER_LEVEL_FRACTIONS)
+)
+OUTER_GEOMETRY_POINT_COUNT = 68 + OUTER_CONTOUR_POINT_COUNT + 8
+OUTER_CONTOUR_GRABCUT_ITERATIONS = 3
+OUTER_CONTOUR_MIN_AREA_RATIO = 0.035
+OUTER_CONTOUR_MAX_AREA_RATIO = 0.88
 
 # 外层已经并行处理不同刺激图，限制 OpenCV 内部线程以避免笔记本过度抢占。
 cv2.setNumThreads(1)
@@ -321,12 +333,346 @@ def align_face_collection_afa(images, landmark_sets):
     return aligned_faces
 
 
-def add_canvas_boundary_points(landmarks, image_shape):
-    """为AFA对齐后的68点增加原算法使用的8个整图边界控制点。"""
+def _outer_contour_measurements(landmarks):
+    """从68点得到外轮廓搜索所需的稳定人脸尺度和中心。"""
     face_points = np.asarray(landmarks[:68], dtype=np.float32)
-    if len(face_points) < 68:
-        return np.array([])
+    jaw = face_points[0:17]
+    brows = face_points[17:27]
+    jaw_left = float(np.min(jaw[:, 0]))
+    jaw_right = float(np.max(jaw[:, 0]))
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_width = max(1.0, jaw_right - jaw_left)
+    face_height = max(1.0, chin_y - brow_top)
+    center_x = 0.5 * (jaw_left + jaw_right)
+    # 射线中心放在上半脸，向左右搜索时落在耳侧而不是肩膀。
+    center_y = brow_top + 0.42 * face_height
+    return {
+        "center": np.float32([center_x, center_y]),
+        "jaw_left": jaw_left,
+        "jaw_right": jaw_right,
+        "brow_top": brow_top,
+        "chin_y": chin_y,
+        "face_width": face_width,
+        "face_height": face_height
+    }
+
+
+def _component_containing_face(binary_mask, face_seed):
+    """只保留与面部种子重叠最多的连通人物区域。"""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (binary_mask > 0).astype(np.uint8),
+        connectivity=8
+    )
+    if count <= 1:
+        return None
+
+    seed_pixels = face_seed > 0
+    best_label = 0
+    best_overlap = 0
+    for label in range(1, count):
+        overlap = int(np.count_nonzero((labels == label) & seed_pixels))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_label = label
+
+    if best_label == 0:
+        component_areas = stats[1:, cv2.CC_STAT_AREA]
+        best_label = int(np.argmax(component_areas)) + 1
+
+    component = np.where(labels == best_label, 255, 0).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        component,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+    solid = np.zeros_like(component)
+    cv2.drawContours(
+        solid,
+        [max(contours, key=cv2.contourArea)],
+        -1,
+        255,
+        thickness=-1
+    )
+    return solid
+
+
+def estimate_person_outer_silhouette(image, landmarks):
+    """用本地GrabCut估计人物外轮廓；结果仅用于放置几何控制点。"""
+    if image is None or landmarks is None or len(landmarks) < 68:
+        return None
+
+    height, width = image.shape[:2]
+    if height < 8 or width < 8:
+        return None
+
+    face_points = np.asarray(landmarks[:68], dtype=np.float32)
+    metrics = _outer_contour_measurements(face_points)
+    center_x, center_y = metrics["center"]
+    face_width = metrics["face_width"]
+    face_height = metrics["face_height"]
+    chin_y = metrics["chin_y"]
+
+    grabcut_mask = np.full((height, width), cv2.GC_BGD, dtype=np.uint8)
+
+    # 头发、耳朵与颈部作为可能前景；下方梯形覆盖可能出现的肩膀。
+    head_center = (
+        int(round(center_x)),
+        int(round(metrics["brow_top"] + 0.28 * face_height))
+    )
+    head_axes = (
+        max(4, int(round(0.82 * face_width))),
+        max(4, int(round(1.02 * face_height)))
+    )
+    cv2.ellipse(
+        grabcut_mask,
+        head_center,
+        head_axes,
+        0,
+        0,
+        360,
+        cv2.GC_PR_FGD,
+        thickness=-1
+    )
+
+    shoulder_top = int(np.clip(round(chin_y), 1, height - 2))
+    shoulder_bottom = height - 2
+    shoulder_top_half_width = 0.42 * face_width
+    shoulder_bottom_half_width = max(0.95 * face_width, 0.42 * width)
+    shoulder_polygon = np.float32([
+        [center_x - shoulder_top_half_width, shoulder_top],
+        [center_x + shoulder_top_half_width, shoulder_top],
+        [center_x + shoulder_bottom_half_width, shoulder_bottom],
+        [center_x - shoulder_bottom_half_width, shoulder_bottom]
+    ])
+    shoulder_polygon[:, 0] = np.clip(shoulder_polygon[:, 0], 1, width - 2)
+    cv2.fillConvexPoly(
+        grabcut_mask,
+        np.int32(np.round(shoulder_polygon)),
+        cv2.GC_PR_FGD
+    )
+
+    # 68点凸包是可靠的确定前景种子，但不会作为最终融合遮罩使用。
+    face_seed = np.zeros((height, width), dtype=np.uint8)
+    face_hull = cv2.convexHull(np.int32(np.round(face_points)))
+    cv2.fillConvexPoly(face_seed, face_hull, 255)
+    grabcut_mask[face_seed > 0] = cv2.GC_FGD
+
+    neck_half_width = max(3, int(round(0.22 * face_width)))
+    neck_top = int(np.clip(round(chin_y - 0.04 * face_height), 1, height - 2))
+    neck_bottom = int(np.clip(round(chin_y + 0.24 * face_height), 1, height - 2))
+    cv2.rectangle(
+        grabcut_mask,
+        (max(1, int(round(center_x)) - neck_half_width), neck_top),
+        (min(width - 2, int(round(center_x)) + neck_half_width), neck_bottom),
+        cv2.GC_FGD,
+        thickness=-1
+    )
+
+    # 画布边界保持确定背景，防止前景区域退化成整张矩形。
+    grabcut_mask[0:2, :] = cv2.GC_BGD
+    grabcut_mask[-2:, :] = cv2.GC_BGD
+    grabcut_mask[:, 0:2] = cv2.GC_BGD
+    grabcut_mask[:, -2:] = cv2.GC_BGD
+
+    try:
+        background_model = np.zeros((1, 65), dtype=np.float64)
+        foreground_model = np.zeros((1, 65), dtype=np.float64)
+        cv2.grabCut(
+            image,
+            grabcut_mask,
+            None,
+            background_model,
+            foreground_model,
+            OUTER_CONTOUR_GRABCUT_ITERATIONS,
+            cv2.GC_INIT_WITH_MASK
+        )
+    except Exception as error:
+        print(f"Outer contour GrabCut fallback: {error}")
+        return None
+
+    foreground = np.where(
+        (grabcut_mask == cv2.GC_FGD) |
+        (grabcut_mask == cv2.GC_PR_FGD),
+        255,
+        0
+    ).astype(np.uint8)
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=2
+    )
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1
+    )
+    foreground = _component_containing_face(foreground, face_seed)
+    if foreground is None:
+        return None
+
+    area_ratio = float(np.count_nonzero(foreground)) / float(height * width)
+    if (
+        area_ratio < OUTER_CONTOUR_MIN_AREA_RATIO or
+        area_ratio > OUTER_CONTOUR_MAX_AREA_RATIO
+    ):
+        return None
+    return foreground
+
+
+def _fallback_head_point(metrics, angle_radians, image_shape):
+    """分割失败时使用与面部尺度绑定的保守头部椭圆。"""
     height, width = image_shape[:2]
+    center = metrics["center"].astype(np.float64)
+    direction = np.array([
+        np.cos(angle_radians),
+        np.sin(angle_radians)
+    ], dtype=np.float64)
+    radius_x = max(2.0, 0.70 * metrics["face_width"])
+    radius_y = max(2.0, 0.92 * metrics["face_height"])
+    denominator = np.sqrt(
+        (direction[0] / radius_x) ** 2 +
+        (direction[1] / radius_y) ** 2
+    )
+    radius = 1.0 / max(denominator, 1e-8)
+    point = center + radius * direction
+    point[0] = np.clip(point[0], 1, width - 2)
+    point[1] = np.clip(point[1], 1, height - 2)
+    return point.astype(np.float32)
+
+
+def _sample_silhouette_ray(mask, center, angle_radians, minimum_radius):
+    """沿固定方向取得与人物连通区域相交的最外像素。"""
+    if mask is None:
+        return None
+    height, width = mask.shape[:2]
+    direction = np.array([
+        np.cos(angle_radians),
+        np.sin(angle_radians)
+    ], dtype=np.float64)
+    corner_distances = [
+        np.hypot(center[0], center[1]),
+        np.hypot(width - 1 - center[0], center[1]),
+        np.hypot(center[0], height - 1 - center[1]),
+        np.hypot(width - 1 - center[0], height - 1 - center[1])
+    ]
+    maximum_radius = max(corner_distances)
+    sample_count = max(2, int(np.ceil(maximum_radius - minimum_radius)) + 1)
+    radii = np.linspace(minimum_radius, maximum_radius, sample_count)
+    coordinates = center[None, :] + radii[:, None] * direction[None, :]
+    x_values = np.rint(coordinates[:, 0]).astype(np.int32)
+    y_values = np.rint(coordinates[:, 1]).astype(np.int32)
+    valid = (
+        (x_values >= 1) & (x_values < width - 1) &
+        (y_values >= 1) & (y_values < height - 1)
+    )
+    if not np.any(valid):
+        return None
+    x_values = x_values[valid]
+    y_values = y_values[valid]
+    foreground_indices = np.flatnonzero(mask[y_values, x_values] > 0)
+    if foreground_indices.size == 0:
+        return None
+    last_index = int(foreground_indices[-1])
+    return np.float32([x_values[last_index], y_values[last_index]])
+
+
+def _sample_silhouette_row(mask, y_value, center_x):
+    """在固定高度获取人物轮廓左右端点。"""
+    if mask is None:
+        return None
+    height, width = mask.shape[:2]
+    y_center = int(np.clip(round(y_value), 1, height - 2))
+    y1 = max(1, y_center - 2)
+    y2 = min(height - 1, y_center + 3)
+    row_coverage = np.mean(mask[y1:y2] > 0, axis=0)
+    foreground_x = np.flatnonzero(row_coverage >= 0.40)
+    if foreground_x.size < 2:
+        return None
+
+    # 选择包含身体中心的连续区段，避免偶然背景区域成为肩部端点。
+    split_positions = np.flatnonzero(np.diff(foreground_x) > 1) + 1
+    segments = np.split(foreground_x, split_positions)
+    center_column = int(np.clip(round(center_x), 0, width - 1))
+    containing = [
+        segment for segment in segments
+        if segment.size > 0 and segment[0] <= center_column <= segment[-1]
+    ]
+    segment = max(
+        containing if containing else segments,
+        key=lambda values: values.size
+    )
+    return np.float32([
+        [max(1, int(segment[0])), y_center],
+        [min(width - 2, int(segment[-1])), y_center]
+    ])
+
+
+def estimate_outer_contour_points(image, landmarks):
+    """生成固定数量、固定语义顺序的头发/耳侧与颈肩控制点。"""
+    face_points = np.asarray(landmarks[:68], dtype=np.float32)
+    metrics = _outer_contour_measurements(face_points)
+    center = metrics["center"].astype(np.float64)
+    silhouette = estimate_person_outer_silhouette(image, face_points)
+    image_shape = image.shape
+
+    outer_points = []
+    minimum_radius = 0.38 * metrics["face_width"]
+    for angle_degrees in OUTER_HEAD_ANGLE_DEGREES:
+        angle_radians = np.deg2rad(float(angle_degrees))
+        point = _sample_silhouette_ray(
+            silhouette,
+            center,
+            angle_radians,
+            minimum_radius
+        )
+        if point is None:
+            point = _fallback_head_point(
+                metrics,
+                angle_radians,
+                image_shape
+            )
+        outer_points.append(point)
+
+    height, width = image_shape[:2]
+    chin_y = metrics["chin_y"]
+    available_height = max(1.0, (height - 2) - chin_y)
+    for level_fraction in OUTER_SHOULDER_LEVEL_FRACTIONS:
+        y_value = chin_y + level_fraction * available_height
+        row_points = _sample_silhouette_row(
+            silhouette,
+            y_value,
+            metrics["center"][0]
+        )
+        if row_points is None:
+            half_width = metrics["face_width"] * (
+                0.42 + 0.72 * level_fraction
+            )
+            row_points = np.float32([
+                [np.clip(metrics["center"][0] - half_width, 1, width - 2),
+                 np.clip(y_value, 1, height - 2)],
+                [np.clip(metrics["center"][0] + half_width, 1, width - 2),
+                 np.clip(y_value, 1, height - 2)]
+            ])
+        outer_points.extend(row_points)
+
+    return np.asarray(outer_points, dtype=np.float32)
+
+
+def build_outer_contour_geometry(image, landmarks):
+    """组合68点、外轮廓点和8个画布边界点供整图Delaunay使用。"""
+    face_points = np.asarray(landmarks[:68], dtype=np.float32)
+    if image is None or len(face_points) < 68:
+        return np.array([])
+    height, width = image.shape[:2]
+    outer_points = estimate_outer_contour_points(image, face_points)
+    if len(outer_points) != OUTER_CONTOUR_POINT_COUNT:
+        return np.array([])
+
     x_max = width - 1
     y_max = height - 1
     boundary_points = np.float32([
@@ -334,7 +680,7 @@ def add_canvas_boundary_points(landmarks, image_shape):
         [x_max, y_max // 2], [x_max, y_max], [x_max // 2, y_max],
         [0, y_max], [0, y_max // 2]
     ])
-    return np.vstack([face_points, boundary_points])
+    return np.vstack([face_points, outer_points, boundary_points])
 
 def get_triangles(points):
     try:
@@ -1257,7 +1603,7 @@ def morph_faces_full(
     points1=None,
     points2=None
 ):
-    """在AFA对齐结果上沿用原整图Delaunay形变与线性融合策略。"""
+    """在AFA对齐结果上执行外轮廓增强的整图Delaunay与线性融合。"""
     try:
         img1_arr = cv2.resize(img1_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
         img2_arr = cv2.resize(img2_arr, (PROCESS_WIDTH, PROCESS_HEIGHT))
@@ -1272,18 +1618,15 @@ def morph_faces_full(
         points1 = np.asarray(points1, dtype=np.float32)
         points2 = np.asarray(points2, dtype=np.float32)
 
-        # 原算法只使用68个人脸点和8个画布边界点。画布边界参与三角剖分，
-        # 因此两张图的头发、耳朵和背景都会随比例共同形变并线性混合。
-        if len(points1) > 76:
-            points1 = np.concatenate((points1[:68], points1[-8:]), axis=0)
-        if len(points2) > 76:
-            points2 = np.concatenate((points2[:68], points2[-8:]), axis=0)
-
         if len(points1) == 0 or len(points2) == 0 or len(points1) != len(points2):
             return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
 
+        # 68个人脸点负责五官，固定顺序的外轮廓点负责头发、耳侧与颈肩，
+        # 最后8个画布点保证三角网格覆盖整张图像。
         points_avg = (1 - alpha) * points1 + alpha * points2
         triangles = get_triangles(points_avg)
+        if len(triangles) == 0:
+            return cv2.addWeighted(img1, 1-alpha, img2, alpha, 0), None
         warp1 = warp_image(img1, points1, points_avg, triangles)
         warp2 = warp_image(img2, points2, points_avg, triangles)
         final_img = cv2.addWeighted(warp1, 1-alpha, warp2, alpha, 0)
@@ -1616,11 +1959,11 @@ def align_afa_stimulus_group(
     aligned_records = align_face_collection_afa(images, landmark_sets)
 
     aligned_subject_image, aligned_subject_detected = aligned_records[0]
-    subject_points = add_canvas_boundary_points(
-        aligned_subject_detected,
-        aligned_subject_image.shape
+    subject_points = build_outer_contour_geometry(
+        aligned_subject_image,
+        aligned_subject_detected
     )
-    if len(subject_points) != 76:
+    if len(subject_points) != OUTER_GEOMETRY_POINT_COUNT:
         raise ValueError("AFA could not prepare the aligned participant face.")
 
     aligned_database_faces = []
@@ -1630,11 +1973,11 @@ def align_afa_stimulus_group(
     ):
         aligned_image, aligned_detected = aligned_record
         database_filename = database_entry[1]
-        database_points = add_canvas_boundary_points(
-            aligned_detected,
-            aligned_image.shape
+        database_points = build_outer_contour_geometry(
+            aligned_image,
+            aligned_detected
         )
-        if len(database_points) != 76:
+        if len(database_points) != OUTER_GEOMETRY_POINT_COUNT:
             raise ValueError(
                 f"AFA could not prepare database face: {database_filename}"
             )
