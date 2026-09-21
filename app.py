@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64
+import hashlib
 import os
 import json
 import time
@@ -68,9 +69,17 @@ PROCESS_WIDTH = 400
 PROCESS_HEIGHT = 533
 OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
-MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+GLOBAL_MORPH_WORKERS = 4
+MAX_ACTIVE_PARTICIPANTS = 2
+MERGE_JOB_TTL_SECONDS = 30 * 60
 DATA_SAVE_LOCK = threading.Lock()
 FACE_ATTRIBUTE_LOCK = threading.Lock()
+MERGE_JOB_LOCK = threading.Lock()
+MERGE_JOBS = {}
+MERGE_JOB_BY_REQUEST = {}
+# 所有被试共享同一个四线程图片工作池；外层工作池只允许两名被试同时进入处理。
+MORPH_EXECUTOR = ThreadPoolExecutor(max_workers=GLOBAL_MORPH_WORKERS)
+PARTICIPANT_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ACTIVE_PARTICIPANTS)
 SONA_COMPLETION_API_URL = os.environ.get(
     'SONA_COMPLETION_API_URL',
     'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
@@ -1192,6 +1201,215 @@ def build_morph_stimulus(job):
     result[job["ratio_key"]] = ratio
     return result
 
+
+def cleanup_merge_jobs_locked():
+    """清理已结束任务的内存结果；本地生成图片不受影响。调用方必须持锁。"""
+    cutoff = time.time() - MERGE_JOB_TTL_SECONDS
+    expired_job_ids = [
+        job_id
+        for job_id, job in MERGE_JOBS.items()
+        if job.get("status") in ("completed", "failed")
+        and job.get("finished_at", 0) < cutoff
+    ]
+    for job_id in expired_job_ids:
+        job = MERGE_JOBS.pop(job_id)
+        request_key = (
+            job["participant_id"],
+            job["request_fingerprint"]
+        )
+        if MERGE_JOB_BY_REQUEST.get(request_key) == job_id:
+            del MERGE_JOB_BY_REQUEST[request_key]
+
+
+def get_merge_queue_position_locked(job_id):
+    """按实际进入时间动态计算当前排队位置。调用方必须持锁。"""
+    queued_jobs = sorted(
+        (
+            (queued_id, queued_job)
+            for queued_id, queued_job in MERGE_JOBS.items()
+            if queued_job.get("status") == "queued"
+        ),
+        key=lambda item: item[1]["created_at"]
+    )
+    for position, (queued_id, _) in enumerate(queued_jobs, start=1):
+        if queued_id == job_id:
+            return position
+    return None
+
+
+def generate_merge_result(payload):
+    """生成一名被试的全部36张刺激图，并返回可直接序列化的结果。"""
+    participant_id = payload["participant_id"]
+    self_gender = payload["self_gender"]
+    partner_gender = payload["partner_gender"]
+    img_self_wide = payload["img_self_wide"]
+    img_partner_wide = payload["img_partner_wide"]
+    self_detected_points = payload["self_detected_points"]
+    partner_detected_points = payload["partner_detected_points"]
+
+    photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
+    partner_filename = save_uploaded_image(img_partner_wide, photo_batch_id, "partner")
+    print(f"[OK] Images saved: {self_filename}, {partner_filename}")
+
+    trial_id = 1
+    ratios = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    morph_jobs = []
+
+    # 本人和伴侣各自固定使用 3 个同性数据库面孔；同一面孔覆盖全部 6 个比例。
+    # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
+    self_db_faces = get_random_original_db_images(self_gender, count=3)
+    partner_excluded_filenames = (
+        {db_filename for _, db_filename, _ in self_db_faces}
+        if self_gender == partner_gender
+        else set()
+    )
+    partner_db_faces = get_random_original_db_images(
+        partner_gender,
+        count=3,
+        excluded_filenames=partner_excluded_filenames
+    )
+    if len(self_db_faces) < 3 or len(partner_db_faces) < 3:
+        raise RuntimeError(
+            "At least three valid same-gender database faces are required "
+            "for each photograph."
+        )
+
+    # 本人与伴侣分别用“上传脸 + 3张数据库脸”建立一次AFA共识形状。
+    (
+        (img_self_aligned, self_points),
+        self_db_faces
+    ) = align_afa_stimulus_group(
+        img_self_wide,
+        self_detected_points,
+        self_db_faces
+    )
+    (
+        (img_partner_aligned, partner_points),
+        partner_db_faces
+    ) = align_afa_stimulus_group(
+        img_partner_wide,
+        partner_detected_points,
+        partner_db_faces
+    )
+
+    for db_index, (db_img, db_filename, db_points) in enumerate(
+        self_db_faces,
+        start=1
+    ):
+        for ratio in ratios:
+            morph_jobs.append({
+                "trial_id": trial_id,
+                "participant_id": participant_id,
+                "subject_image": img_self_aligned,
+                "subject_points": self_points,
+                "database_image": db_img,
+                "database_points": db_points,
+                "ratio": ratio,
+                "ratio_key": "ratio_self",
+                "stimulus_type": "self_morph",
+                "description": f"Self Morph {int(ratio*100)}% / Face {db_index}",
+                "source_upload": self_filename,
+                "source_db": db_filename
+            })
+            trial_id += 1
+
+    for db_index, (db_img, db_filename, db_points) in enumerate(
+        partner_db_faces,
+        start=1
+    ):
+        for ratio in ratios:
+            morph_jobs.append({
+                "trial_id": trial_id,
+                "participant_id": participant_id,
+                "subject_image": img_partner_aligned,
+                "subject_points": partner_points,
+                "database_image": db_img,
+                "database_points": db_points,
+                "ratio": ratio,
+                "ratio_key": "ratio_partner",
+                "stimulus_type": "partner_morph",
+                "description": f"Partner Morph {int(ratio*100)}% / Face {db_index}",
+                "source_upload": partner_filename,
+                "source_db": db_filename
+            })
+            trial_id += 1
+
+    # 两名并发被试的刺激图都提交给同一个四线程池。每轮只提交4张，
+    # 避免先到被试一次占满队列，使稍后进入的第二名被试长期得不到线程。
+    result_images = []
+    for chunk_start in range(0, len(morph_jobs), GLOBAL_MORPH_WORKERS):
+        job_chunk = morph_jobs[
+            chunk_start:chunk_start + GLOBAL_MORPH_WORKERS
+        ]
+        morph_futures = [
+            MORPH_EXECUTOR.submit(build_morph_stimulus, job)
+            for job in job_chunk
+        ]
+        result_images.extend(future.result() for future in morph_futures)
+    random.shuffle(result_images)
+    return {
+        "status": "completed",
+        "participant_id": participant_id,
+        "photo_batch_id": photo_batch_id,
+        "images": result_images
+    }
+
+
+def run_merge_job(job_id, payload):
+    """由双被试工作池调用；任务一开始就移除前端的排队状态。"""
+    with MERGE_JOB_LOCK:
+        job = MERGE_JOBS.get(job_id)
+        if job is None:
+            return
+        job["status"] = "processing"
+        job["started_at"] = time.time()
+
+    try:
+        result = generate_merge_result(payload)
+    except Exception as error:
+        traceback.print_exc()
+        with MERGE_JOB_LOCK:
+            job = MERGE_JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "failed"
+                job["error"] = str(error)
+                job["finished_at"] = time.time()
+        return
+
+    with MERGE_JOB_LOCK:
+        job = MERGE_JOBS.get(job_id)
+        if job is not None:
+            job["status"] = "completed"
+            job["result"] = result
+            job["finished_at"] = time.time()
+
+
+def merge_job_response(job_id):
+    """创建轻量状态响应；完成时仍直接返回Base64图片数据。"""
+    with MERGE_JOB_LOCK:
+        cleanup_merge_jobs_locked()
+        job = MERGE_JOBS.get(job_id)
+        if job is None:
+            return None
+        status = job["status"]
+        if status == "queued":
+            return {
+                "status": "queued",
+                "job_id": job_id,
+                "queue_position": get_merge_queue_position_locked(job_id)
+            }
+        if status == "processing":
+            return {"status": "processing", "job_id": job_id}
+        if status == "failed":
+            return {
+                "status": "failed",
+                "job_id": job_id,
+                "error": job.get("error", "Face processing failed."),
+                "code": "MERGE_PROCESSING_ERROR"
+            }
+        return {"job_id": job_id, **job["result"]}
+
 # --- 核心路由: 图片融合处理 ---
 @app.route('/merge_faces', methods=['POST'])
 def process_images_experiment():
@@ -1206,6 +1424,13 @@ def process_images_experiment():
 
         self_gender = data.get('self_gender', 'male')
         partner_gender = data.get('partner_gender', 'female')
+        request_fingerprint = hashlib.sha256(
+            (
+                f"{self_gender}|{partner_gender}|"
+                f"{data.get('self_image') or ''}|"
+                f"{data.get('partner_image') or ''}"
+            ).encode('utf-8')
+        ).hexdigest()
         raw_self = base64_to_cv2(data.get('self_image'))
         raw_partner = base64_to_cv2(data.get('partner_image'))
         
@@ -1281,108 +1506,67 @@ def process_images_experiment():
                 "issues": occlusion_issues
             }), 422
 
-        photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
-        partner_filename = save_uploaded_image(img_partner_wide, photo_batch_id, "partner")
-        print(f"[OK] Images saved: {self_filename}, {partner_filename}")
-
-        result_images = []
-        trial_id = 1
-        ratios = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-        morph_jobs = []
-
-        # 本人和伴侣各自固定使用 3 个同性数据库面孔；同一面孔覆盖全部 6 个比例。
-        # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
-        self_db_faces = get_random_original_db_images(self_gender, count=3)
-        partner_excluded_filenames = (
-            {db_filename for _, db_filename, _ in self_db_faces}
-            if self_gender == partner_gender
-            else set()
-        )
-        partner_db_faces = get_random_original_db_images(
-            partner_gender,
-            count=3,
-            excluded_filenames=partner_excluded_filenames
-        )
-        if len(self_db_faces) < 3 or len(partner_db_faces) < 3:
-            return jsonify({
-                "error": "At least three valid same-gender database faces are required for each photograph.",
-                "code": "INSUFFICIENT_DATABASE_FACES"
-            }), 500
-
-        # AFA 的 GPA 必须在同一刺激集合上计算共识形状。本人组和伴侣组
-        # 各自由“上传脸 + 3张固定数据库脸”建立一次参考形状；同一组的
-        # 六个比例共享完全相同的对齐图与关键点。
-        (
-            (img_self_aligned, self_points),
-            self_db_faces
-        ) = align_afa_stimulus_group(
-            img_self_wide,
-            self_detected_points,
-            self_db_faces
-        )
-        (
-            (img_partner_aligned, partner_points),
-            partner_db_faces
-        ) = align_afa_stimulus_group(
-            img_partner_wide,
-            partner_detected_points,
-            partner_db_faces
-        )
-
-        # 1. Self Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points) in enumerate(self_db_faces, start=1):
-            for ratio in ratios:
-                morph_jobs.append({
-                    "trial_id": trial_id,
-                    "participant_id": participant_id,
-                    "subject_image": img_self_aligned,
-                    "subject_points": self_points,
-                    "database_image": db_img,
-                    "database_points": db_points,
-                    "ratio": ratio,
-                    "ratio_key": "ratio_self",
-                    "stimulus_type": "self_morph",
-                    "description": f"Self Morph {int(ratio*100)}% / Face {db_index}",
-                    "source_upload": self_filename,
-                    "source_db": db_filename
-                })
-                trial_id += 1
-
-        # 2. Partner Morphs: 3 database identities × 6 ratios = 18 images
-        for db_index, (db_img, db_filename, db_points) in enumerate(partner_db_faces, start=1):
-            for ratio in ratios:
-                morph_jobs.append({
-                    "trial_id": trial_id,
-                    "participant_id": participant_id,
-                    "subject_image": img_partner_aligned,
-                    "subject_points": partner_points,
-                    "database_image": db_img,
-                    "database_points": db_points,
-                    "ratio": ratio,
-                    "ratio_key": "ratio_partner",
-                    "stimulus_type": "partner_morph",
-                    "description": f"Partner Morph {int(ratio*100)}% / Face {db_index}",
-                    "source_upload": partner_filename,
-                    "source_db": db_filename
-                })
-                trial_id += 1
-
-        # 人脸检测已在主线程完成；这里只并行执行相互独立的几何变换。
-        with ThreadPoolExecutor(max_workers=MAX_MORPH_WORKERS) as executor:
-            result_images.extend(executor.map(build_morph_stimulus, morph_jobs))
-
-        random.shuffle(result_images)
-        return jsonify({
-            "status": "success",
+        payload = {
             "participant_id": participant_id,
-            "photo_batch_id": photo_batch_id,
-            "images": result_images
-        })
+            "self_gender": self_gender,
+            "partner_gender": partner_gender,
+            "img_self_wide": img_self_wide,
+            "img_partner_wide": img_partner_wide,
+            "self_detected_points": self_detected_points,
+            "partner_detected_points": partner_detected_points
+        }
+
+        # 后端防重复：同一被试提交相同两张照片时复用原任务；重新上传
+        # 不同照片则创建新任务，保证最终使用的是最后确认的照片。
+        with MERGE_JOB_LOCK:
+            cleanup_merge_jobs_locked()
+            request_key = (participant_id, request_fingerprint)
+            existing_job_id = MERGE_JOB_BY_REQUEST.get(request_key)
+            existing_job = (
+                MERGE_JOBS.get(existing_job_id)
+                if existing_job_id
+                else None
+            )
+            if (
+                existing_job
+                and existing_job.get("status") != "failed"
+                and existing_job.get("request_fingerprint") == request_fingerprint
+            ):
+                job_id = existing_job_id
+            else:
+                job_id = uuid.uuid4().hex
+                MERGE_JOBS[job_id] = {
+                    "participant_id": participant_id,
+                    "request_fingerprint": request_fingerprint,
+                    "status": "queued",
+                    "created_at": time.time()
+                }
+                MERGE_JOB_BY_REQUEST[request_key] = job_id
+                PARTICIPANT_EXECUTOR.submit(run_merge_job, job_id, payload)
+
+        response_body = merge_job_response(job_id)
+        if response_body is None:
+            return jsonify({"error": "Merge job could not be created."}), 500
+        return jsonify(response_body), 202
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/merge_status/<job_id>', methods=['GET'])
+def get_merge_status(job_id):
+    if not re.fullmatch(r'^[a-f0-9]{32}$', job_id):
+        return jsonify({"error": "Invalid merge job ID"}), 400
+
+    response_body = merge_job_response(job_id)
+    if response_body is None:
+        return jsonify({"error": "Merge job not found or expired"}), 404
+    response = jsonify(response_body)
+    response.headers['Cache-Control'] = 'no-store'
+    if response_body["status"] == "failed":
+        return response, 500
+    return response
 
 # --- 删除被试照片 ---
 @app.route('/delete_participant_faces', methods=['POST'])
