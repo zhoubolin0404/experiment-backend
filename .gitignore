@@ -12,6 +12,7 @@ ngrok.yml
 
 # Participant data and experiment results must never be published
 participant_faces/
+generated_faces/
 data/
 
 # Licensed/runtime image assets are provisioned on the deployment machine
