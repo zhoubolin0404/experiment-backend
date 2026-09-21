@@ -54,6 +54,11 @@ def load_local_environment(env_filepath):
 load_local_environment(os.path.join(BASE_DIR, '.env'))
 
 PREDICTOR_PATH = os.path.join(BASE_DIR, 'shape_predictor_68_face_landmarks.dat')
+FACE_ATTRIBUTE_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    'models',
+    'face_attrib_net.onnx'
+)
 DATABASE_PATH = os.path.join(BASE_DIR, 'database')
 PARTICIPANT_FACES_PATH = os.path.join(BASE_DIR, 'participant_faces')
 GENERATED_FACES_PATH = os.path.join(BASE_DIR, 'generated_faces')
@@ -65,6 +70,7 @@ OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
 MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 DATA_SAVE_LOCK = threading.Lock()
+FACE_ATTRIBUTE_LOCK = threading.Lock()
 SONA_COMPLETION_API_URL = os.environ.get(
     'SONA_COMPLETION_API_URL',
     'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
@@ -73,6 +79,23 @@ SONA_EXPERIMENT_ID = os.environ.get('SONA_EXPERIMENT_ID', '2514')
 # 安全起见，credit token 只能由后端环境变量提供，不能提交到公开仓库。
 SONA_CREDIT_TOKEN = os.environ.get('SONA_CREDIT_TOKEN', '').strip()
 SONA_REQUEST_TIMEOUT_SECONDS = 15
+
+# FaceAttribNet 输出顺序：左眼睁开、右眼睁开、普通眼镜、口罩、太阳镜。
+# 模型仅对两张上传照片各执行一次，不会对36张融合刺激重复执行。
+FACE_ATTRIBUTE_INPUT_SIZE = 128
+FACE_ATTRIBUTE_LABELS = (
+    'left_eye_open',
+    'right_eye_open',
+    'eyeglasses',
+    'mask',
+    'sunglasses'
+)
+FACE_OCCLUSION_THRESHOLDS = {
+    'eyeglasses': 0.70,
+    'mask': 0.70,
+    'sunglasses': 0.70
+}
+FACE_EYE_VISIBILITY_THRESHOLD = 0.20
 
 FACE_CANVAS_VALUE = 255
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
@@ -110,6 +133,8 @@ os.makedirs(os.path.join(DATABASE_PATH, 'female'), exist_ok=True)
 # --- 初始化 Dlib 模型 ---
 detector = None
 predictor = None
+face_attribute_net = None
+FACE_ATTRIBUTE_MODEL_ERROR = ''
 try:
     detector = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor(PREDICTOR_PATH)
@@ -117,6 +142,17 @@ try:
 except Exception as e:
     print(f"[ERROR] Dlib model could not be loaded from '{PREDICTOR_PATH}'.")
     print(e)
+
+try:
+    if not os.path.isfile(FACE_ATTRIBUTE_MODEL_PATH):
+        raise FileNotFoundError(
+            f"Face attribute model not found: {FACE_ATTRIBUTE_MODEL_PATH}"
+        )
+    face_attribute_net = cv2.dnn.readNetFromONNX(FACE_ATTRIBUTE_MODEL_PATH)
+    print("[OK] Face occlusion model loaded successfully.")
+except Exception as e:
+    FACE_ATTRIBUTE_MODEL_ERROR = str(e)
+    print(f"[ERROR] Face occlusion model could not be loaded: {e}")
 
 # --- 核心图像处理函数 ---
 # 这些函数负责特征点检测、规范对齐、三角剖分、仿射变换和人脸融合。
@@ -154,6 +190,96 @@ def get_points(image):
     except Exception as e:
         print(f"Error in get_points: {e}")
         return np.array([])
+
+
+def _prepare_face_attribute_input(image, points):
+    """从68点区域构造FaceAttribNet所需的128×128 RGB letterbox张量。"""
+    face_points = np.asarray(points[:68], dtype=np.float32)
+    jaw = face_points[0:17]
+    brows = face_points[17:27]
+    jaw_left = float(np.min(jaw[:, 0]))
+    jaw_right = float(np.max(jaw[:, 0]))
+    brow_top = float(np.min(brows[:, 1]))
+    chin_y = float(np.max(jaw[:, 1]))
+    face_width = max(1.0, jaw_right - jaw_left)
+    face_height = max(1.0, chin_y - brow_top)
+
+    height, width = image.shape[:2]
+    x1 = max(0, int(round(jaw_left - 0.18 * face_width)))
+    x2 = min(width, int(round(jaw_right + 0.18 * face_width)))
+    y1 = max(0, int(round(brow_top - 0.52 * face_height)))
+    y2 = min(height, int(round(chin_y + 0.12 * face_height)))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("The detected face crop is invalid.")
+
+    face_crop = image[y1:y2, x1:x2]
+    crop_height, crop_width = face_crop.shape[:2]
+    scale = min(
+        FACE_ATTRIBUTE_INPUT_SIZE / float(crop_width),
+        FACE_ATTRIBUTE_INPUT_SIZE / float(crop_height)
+    )
+    resized_width = max(1, int(round(crop_width * scale)))
+    resized_height = max(1, int(round(crop_height * scale)))
+    resized = cv2.resize(
+        face_crop,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    )
+
+    letterbox = np.zeros(
+        (FACE_ATTRIBUTE_INPUT_SIZE, FACE_ATTRIBUTE_INPUT_SIZE, 3),
+        dtype=np.uint8
+    )
+    offset_x = (FACE_ATTRIBUTE_INPUT_SIZE - resized_width) // 2
+    offset_y = (FACE_ATTRIBUTE_INPUT_SIZE - resized_height) // 2
+    letterbox[
+        offset_y:offset_y + resized_height,
+        offset_x:offset_x + resized_width
+    ] = resized
+
+    rgb = cv2.cvtColor(letterbox, cv2.COLOR_BGR2RGB).astype(np.float32)
+    rgb /= 255.0
+    return np.transpose(rgb, (2, 0, 1))[None, ...]
+
+
+def assess_face_occlusion(image, points):
+    """检测口罩、普通眼镜、太阳镜以及眼部不可见，返回概率与问题码。"""
+    if face_attribute_net is None:
+        raise RuntimeError(
+            "Face occlusion checking is unavailable: " +
+            (FACE_ATTRIBUTE_MODEL_ERROR or "model was not initialized")
+        )
+
+    model_input = _prepare_face_attribute_input(image, points)
+    with FACE_ATTRIBUTE_LOCK:
+        face_attribute_net.setInput(model_input)
+        raw_output = face_attribute_net.forward()
+
+    values = np.asarray(raw_output, dtype=np.float32).reshape(-1)
+    if len(values) < len(FACE_ATTRIBUTE_LABELS):
+        raise RuntimeError("Face occlusion model returned an invalid output.")
+    probabilities = {
+        label: float(np.clip(values[index], 0.0, 1.0))
+        for index, label in enumerate(FACE_ATTRIBUTE_LABELS)
+    }
+
+    issues = []
+    # 太阳镜常会同时触发普通眼镜输出，只保留更明确的太阳镜原因。
+    if probabilities['sunglasses'] >= FACE_OCCLUSION_THRESHOLDS['sunglasses']:
+        issues.append('sunglasses_detected')
+    elif probabilities['eyeglasses'] >= FACE_OCCLUSION_THRESHOLDS['eyeglasses']:
+        issues.append('eyeglasses_detected')
+
+    if probabilities['mask'] >= FACE_OCCLUSION_THRESHOLDS['mask']:
+        issues.append('face_covering_detected')
+
+    if min(
+        probabilities['left_eye_open'],
+        probabilities['right_eye_open']
+    ) < FACE_EYE_VISIBILITY_THRESHOLD:
+        issues.append('eyes_not_clearly_visible')
+
+    return probabilities, issues
 
 
 def _normalize_landmark_shape(points, fit_indices):
@@ -1119,6 +1245,49 @@ def process_images_experiment():
                       "sunglasses, or face coverings, then try again."
                 ),
                 "code": "FACE_QUALITY_ERROR"
+            }), 422
+
+        try:
+            occlusion_checks = {
+                'self': assess_face_occlusion(
+                    img_self_wide,
+                    self_detected_points
+                ),
+                'partner': assess_face_occlusion(
+                    img_partner_wide,
+                    partner_detected_points
+                )
+            }
+        except Exception as e:
+            print(f"Face occlusion check failed: {e}")
+            return jsonify({
+                "error": (
+                    "The automated photograph check is temporarily unavailable. "
+                    "Please ask the researcher to restart the experiment server."
+                ),
+                "code": "FACE_OCCLUSION_CHECK_UNAVAILABLE"
+            }), 503
+
+        occlusion_issues = {
+            role: issues
+            for role, (_, issues) in occlusion_checks.items()
+            if issues
+        }
+        if occlusion_issues:
+            affected_roles = []
+            if 'self' in occlusion_issues:
+                affected_roles.append("your photograph")
+            if 'partner' in occlusion_issues:
+                affected_roles.append("your partner's photograph")
+            return jsonify({
+                "error": (
+                    "Glasses, sunglasses, a face covering, or an eye that is not "
+                    "clearly visible was detected in "
+                    + " and ".join(affected_roles)
+                    + ". Please upload a new clear, unobstructed photograph."
+                ),
+                "code": "FACE_OCCLUSION_ERROR",
+                "issues": occlusion_issues
             }), 422
 
         photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

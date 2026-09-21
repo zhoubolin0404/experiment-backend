@@ -19,6 +19,7 @@ data/
 database/
 AMFD Faces Final/
 shape_predictor_68_face_landmarks.dat
+models/*.onnx
 
 # Large local source archives and research workbooks
 *.zip
