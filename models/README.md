@@ -14,6 +14,10 @@ and returns five independent probabilities in this order:
 4. face mask
 5. sunglasses
 
+The experiment's upload gate uses only outputs 3 and 5 (`eyeglasses` and
+`sunglasses`). Mask and eye-open probabilities are intentionally ignored and
+cannot cause a photograph to be rejected.
+
 Download location:
 
 <https://github.com/yakhyo/face-attribute/releases/download/weights/face_attrib_net.onnx>

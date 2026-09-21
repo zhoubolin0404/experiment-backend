@@ -81,7 +81,7 @@ SONA_CREDIT_TOKEN = os.environ.get('SONA_CREDIT_TOKEN', '').strip()
 SONA_REQUEST_TIMEOUT_SECONDS = 15
 
 # FaceAttribNet 输出顺序：左眼睁开、右眼睁开、普通眼镜、口罩、太阳镜。
-# 模型仅对两张上传照片各执行一次，不会对36张融合刺激重复执行。
+# 本实验只使用普通眼镜和太阳镜两个输出；模型仅对两张上传照片各执行一次。
 FACE_ATTRIBUTE_INPUT_SIZE = 128
 FACE_ATTRIBUTE_LABELS = (
     'left_eye_open',
@@ -92,10 +92,8 @@ FACE_ATTRIBUTE_LABELS = (
 )
 FACE_OCCLUSION_THRESHOLDS = {
     'eyeglasses': 0.70,
-    'mask': 0.70,
     'sunglasses': 0.70
 }
-FACE_EYE_VISIBILITY_THRESHOLD = 0.20
 
 FACE_CANVAS_VALUE = 255
 FACE_ALIGN_LEFT_EYE = (0.34, 0.40)
@@ -243,7 +241,7 @@ def _prepare_face_attribute_input(image, points):
 
 
 def assess_face_occlusion(image, points):
-    """检测口罩、普通眼镜、太阳镜以及眼部不可见，返回概率与问题码。"""
+    """检测普通眼镜和太阳镜，返回模型概率与问题码。"""
     if face_attribute_net is None:
         raise RuntimeError(
             "Face occlusion checking is unavailable: " +
@@ -269,15 +267,6 @@ def assess_face_occlusion(image, points):
         issues.append('sunglasses_detected')
     elif probabilities['eyeglasses'] >= FACE_OCCLUSION_THRESHOLDS['eyeglasses']:
         issues.append('eyeglasses_detected')
-
-    if probabilities['mask'] >= FACE_OCCLUSION_THRESHOLDS['mask']:
-        issues.append('face_covering_detected')
-
-    if min(
-        probabilities['left_eye_open'],
-        probabilities['right_eye_open']
-    ) < FACE_EYE_VISIBILITY_THRESHOLD:
-        issues.append('eyes_not_clearly_visible')
 
     return probabilities, issues
 
@@ -1281,10 +1270,12 @@ def process_images_experiment():
                 affected_roles.append("your partner's photograph")
             return jsonify({
                 "error": (
-                    "Glasses, sunglasses, a face covering, or an eye that is not "
-                    "clearly visible was detected in "
+                    "The photo requirements were not met for "
                     + " and ".join(affected_roles)
-                    + ". Please upload a new clear, unobstructed photograph."
+                    + ". Please use a clear, well-lit, front-facing photograph "
+                      "with a clean, uncluttered background. Remove glasses, "
+                      "sunglasses, and face coverings, and keep a neutral "
+                      "expression without smiling or making faces."
                 ),
                 "code": "FACE_OCCLUSION_ERROR",
                 "issues": occlusion_issues
