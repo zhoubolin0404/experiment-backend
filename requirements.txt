@@ -8,5 +8,3 @@ waitress
 requests
 cmake
 dlib-bin
-pandas
-openpyxl

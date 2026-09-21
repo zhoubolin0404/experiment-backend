@@ -24,7 +24,6 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-import pandas as pd  # 数据处理库
 
 app = Flask(__name__)
 
@@ -67,7 +66,6 @@ OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
 MAX_MORPH_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 DATA_SAVE_LOCK = threading.Lock()
-EXCEL_SAVE_LOCK = threading.Lock()
 SONA_COMPLETION_API_URL = os.environ.get(
     'SONA_COMPLETION_API_URL',
     'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
@@ -2369,6 +2367,11 @@ def save_data():
             return jsonify({"error": "Invalid participant ID"}), 400
         
         data['participant_id'] = participant_id
+        try:
+            save_revision = max(0, int(data.get('save_revision', 0)))
+        except (TypeError, ValueError):
+            save_revision = 0
+        data['save_revision'] = save_revision
         is_complete = data.get('is_complete', False)
         
         # 1. JSON 是最终数据的主记录。采用锁和原子替换，避免自动保存与最终保存并发写坏文件。
@@ -2400,8 +2403,19 @@ def save_data():
                 existing_data.get('is_complete') is True and
                 not is_complete
             )
+            try:
+                existing_revision = int(
+                    existing_data.get('save_revision', 0)
+                    if isinstance(existing_data, dict)
+                    else 0
+                )
+            except (TypeError, ValueError):
+                existing_revision = 0
+            preserve_newer_partial = (
+                not is_complete and existing_revision > save_revision
+            )
 
-            if not preserve_completed_record:
+            if not preserve_completed_record and not preserve_newer_partial:
                 _write_json_atomically(json_filepath, data)
 
         sona_completion = data.get('sona_completion')
@@ -2416,126 +2430,12 @@ def save_data():
             with DATA_SAVE_LOCK:
                 _write_json_atomically(json_filepath, data)
 
-        excel_saved = None
-        excel_destination = None
-        excel_warning = None
-            
-        # 2. 只有当实验标记为 完成 (is_complete = True) 时，才去读写 Excel
-        if is_complete:
-            # Windows PowerShell 常使用 GBK 控制台，日志必须避免 emoji，否则会在保存前抛出编码异常。
-            print(f"[INFO] Experiment complete (ID: {participant_id}); syncing data to Excel...")
-            excel_master_path = os.path.join(DATA_SAVE_PATH, 'all_experiment_data.xlsx')
-            
-            # --- 构建数据行 ---
-            common_info = {
-                'Participant_ID': participant_id,
-                'SONA_ID': data.get('sona_id', ''),
-                'Timestamp': data.get('timestamp', datetime.now().isoformat()),
-                'Condition_Group': data.get('condition_group'),
-                'Self_Gender': data.get('gender_info', {}).get('self'),
-                'Partner_Gender': data.get('gender_info', {}).get('partner'),
-                'User_Profile_Text': data.get('user_profile'),
-                'SONA_Completion_Status': (
-                    sona_completion.get('status', '')
-                    if isinstance(sona_completion, dict)
-                    else ''
-                ),
-                'SONA_Credit_Granted': (
-                    sona_completion.get('success', '')
-                    if isinstance(sona_completion, dict)
-                    else ''
-                ),
-                'SONA_Completion_Message': (
-                    sona_completion.get('message', '')
-                    if isinstance(sona_completion, dict)
-                    else ''
-                ),
-                'Mode': data.get('mode'),
-                'Is_Complete': is_complete
-            }
-            
-            # 问卷数据
-            q_answers = data.get('pre_questionnaire', {})
-            for i in range(16):
-                common_info[f'Q_{i+1}'] = q_answers.get(str(i), '')
-
-            rows = []
-            experiment_trials = data.get('experiment_data', [])
-            
-            if not experiment_trials:
-                rows.append(common_info)
-            else:
-                for trial in experiment_trials:
-                    row = common_info.copy()
-                    row.update({
-                        'Trial_Index': trial.get('trial_index'),
-                        'Stimulus_ID': trial.get('stimulus_id'),
-                        'Stimulus_Type': trial.get('stimulus_type'),
-                        'Ratio_Level': trial.get('ratio_level'),
-                        'Source_DB_Image': trial.get('source_db_image'),
-                        'Source_Upload_Image': trial.get('source_upload_image'),
-                        'Action': trial.get('action'),
-                        'RT_ms': trial.get('reaction_time_ms'),
-                        'Rating_Desirability': trial.get('rating_desirability'),
-                        'Rating_Willingness': trial.get('rating_willingness')
-                    })
-                    rows.append(row)
-            
-            new_df = pd.DataFrame(rows)
-            
-            # --- 写入 Excel：串行处理并先写临时文件，避免多名被试同时完成时损坏主表。 ---
-            excel_temp_path = None
-            with EXCEL_SAVE_LOCK:
-                try:
-                    if os.path.exists(excel_master_path):
-                        old_df = pd.read_excel(excel_master_path)
-                        if 'Participant_ID' in old_df.columns:
-                            old_df = old_df[old_df['Participant_ID'] != participant_id]
-                        combined_df = pd.concat([old_df, new_df], ignore_index=True)
-                    else:
-                        combined_df = new_df
-
-                    excel_temp_path = os.path.join(
-                        DATA_SAVE_PATH,
-                        f".all_experiment_data.{uuid.uuid4().hex}.tmp.xlsx"
-                    )
-                    combined_df.to_excel(excel_temp_path, index=False)
-                    os.replace(excel_temp_path, excel_master_path)
-                    excel_saved = True
-                    excel_destination = 'master'
-                    print(f"[OK] Excel updated: {excel_master_path}")
-                except Exception as excel_err:
-                    excel_warning = f"Master Excel update failed: {excel_err}"
-                    print(f"[ERROR] {excel_warning}")
-                    backup_path = os.path.join(
-                        DATA_SAVE_PATH,
-                        f"backup_{participant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xlsx"
-                    )
-                    try:
-                        new_df.to_excel(backup_path, index=False)
-                        excel_saved = True
-                        excel_destination = 'backup'
-                        print(f"[OK] Data saved to backup: {backup_path}")
-                    except Exception as backup_err:
-                        excel_saved = False
-                        excel_warning = (
-                            f"{excel_warning}; backup Excel write failed: {backup_err}. "
-                            "The complete JSON record was saved successfully."
-                        )
-                        print(f"[ERROR] {excel_warning}")
-                finally:
-                    if excel_temp_path and os.path.exists(excel_temp_path):
-                        os.remove(excel_temp_path)
-
         response_body = {
             "status": "success",
             "participant_id": participant_id,
-            "json_saved": True,
-            "excel_saved": excel_saved,
-            "excel_destination": excel_destination
+            "save_revision": save_revision,
+            "json_saved": True
         }
-        if excel_warning:
-            response_body["warning"] = excel_warning
         if is_complete:
             response_body["sona_completion"] = sona_completion
             if not sona_completion.get('success'):
