@@ -2350,6 +2350,45 @@ def _write_json_atomically(json_filepath, data):
         if os.path.exists(json_temp_path):
             os.remove(json_temp_path)
 
+
+def _build_experiment_json_file_info(data, is_complete):
+    """生成会话的临时文件名、最终文件名和最终文件搜索模式。"""
+    raw_sona_id = str(data.get('sona_id') or 'sona').strip() or 'sona'
+    safe_sona_id = re.sub(r'[^A-Za-z0-9._-]+', '_', raw_sona_id)
+    safe_sona_id = (safe_sona_id.strip('._-')[:128] or 'sona')
+
+    start_timestamp = str(data.get('file_start_timestamp') or '').strip()
+    if not re.fullmatch(r'^\d{12}$', start_timestamp):
+        start_timestamp = datetime.now().strftime('%Y%m%d%H%M')
+    data['file_start_timestamp'] = start_timestamp
+
+    end_timestamp = str(data.get('file_end_timestamp') or '').strip()
+    if is_complete and not re.fullmatch(r'^\d{12}$', end_timestamp):
+        end_timestamp = datetime.now().strftime('%Y%m%d%H%M')
+    data['file_end_timestamp'] = end_timestamp if is_complete else ''
+
+    filename_prefix = f"{safe_sona_id}_{start_timestamp}"
+    incomplete_filename = f"{filename_prefix}_incomplete.json"
+    json_filename = (
+        f"{filename_prefix}_{end_timestamp}.json"
+        if is_complete
+        else incomplete_filename
+    )
+    final_filename_pattern = (
+        f"{filename_prefix}_{'[0-9]' * 12}.json"
+    )
+    return json_filename, incomplete_filename, final_filename_pattern
+
+
+def _read_json_record(json_filepath):
+    if not os.path.isfile(json_filepath):
+        return None
+    try:
+        with open(json_filepath, 'r', encoding='utf-8') as existing_file:
+            return json.load(existing_file)
+    except (OSError, ValueError):
+        return None
+
 # --- 核心路由: 数据保存 ---
 @app.route('/save_data', methods=['POST'])
 def save_data():
@@ -2375,16 +2414,37 @@ def save_data():
         is_complete = data.get('is_complete', False)
         
         # 1. JSON 是最终数据的主记录。采用锁和原子替换，避免自动保存与最终保存并发写坏文件。
-        json_filename = f"experiment_data_{participant_id}.json"
+        (
+            json_filename,
+            incomplete_filename,
+            final_filename_pattern
+        ) = _build_experiment_json_file_info(data, is_complete)
         json_filepath = os.path.join(DATA_SAVE_PATH, json_filename)
+        incomplete_filepath = os.path.join(
+            DATA_SAVE_PATH,
+            incomplete_filename
+        )
         with DATA_SAVE_LOCK:
-            existing_data = None
-            if os.path.isfile(json_filepath):
-                try:
-                    with open(json_filepath, 'r', encoding='utf-8') as existing_file:
-                        existing_data = json.load(existing_file)
-                except (OSError, ValueError):
-                    existing_data = None
+            existing_data = _read_json_record(json_filepath)
+            if is_complete and existing_data is None:
+                existing_data = _read_json_record(incomplete_filepath)
+
+            # 最终文件与自动保存文件名不同，因此需显式检查同一参与者是否已经完成。
+            if not is_complete:
+                final_search_path = os.path.join(
+                    DATA_SAVE_PATH,
+                    final_filename_pattern
+                )
+                for completed_filepath in glob.glob(final_search_path):
+                    completed_data = _read_json_record(completed_filepath)
+                    if (
+                        isinstance(completed_data, dict) and
+                        completed_data.get('is_complete') is True and
+                        str(completed_data.get('participant_id', '')) ==
+                        str(participant_id)
+                    ):
+                        existing_data = completed_data
+                        break
 
             # 如果上一次最终请求已经成功授予 credit，重试时直接复用结果，
             # 避免因前端未收到响应而重复请求 SONA。
@@ -2417,6 +2477,12 @@ def save_data():
 
             if not preserve_completed_record and not preserve_newer_partial:
                 _write_json_atomically(json_filepath, data)
+                if (
+                    is_complete and
+                    incomplete_filepath != json_filepath and
+                    os.path.isfile(incomplete_filepath)
+                ):
+                    os.remove(incomplete_filepath)
 
         sona_completion = data.get('sona_completion')
         if is_complete and not (
@@ -2434,6 +2500,7 @@ def save_data():
             "status": "success",
             "participant_id": participant_id,
             "save_revision": save_revision,
+            "json_filename": json_filename,
             "json_saved": True
         }
         if is_complete:
