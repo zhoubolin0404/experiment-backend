@@ -17,6 +17,9 @@ import shutil
 import re
 import threading
 import uuid
+import multiprocessing
+import pickle
+import tempfile
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -27,7 +30,7 @@ from functools import lru_cache
 app = Flask(__name__)
 
 # 允许跨域和特殊请求头 (ngrok-skip-browser-warning 是为了穿透 Ngrok 的拦截页)
-CORS(app, resources={r"/*": {"origins": "*"}}, allow_headers=["Content-Type", "Authorization", "ngrok-skip-browser-warning"])
+CORS(app, resources={r"/*": {"origins": "*"}}, allow_headers=["Content-Type", "Authorization", "ngrok-skip-browser-warning", "X-Merge-Session"])
 
 # --- 全局配置变量 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,17 +73,21 @@ PROCESS_HEIGHT = 533
 OUTPUT_WIDTH = 400
 OUTPUT_HEIGHT = 533
 GLOBAL_MORPH_WORKERS = 4
-MAX_ACTIVE_PARTICIPANTS = 2
+MAX_ACTIVE_PARTICIPANTS = 1
 MERGE_JOB_TTL_SECONDS = 30 * 60
+MERGE_JOB_LEASE_SECONDS = 25
+MERGE_POLL_INTERVAL_SECONDS = 0.5
+MERGE_WORK_PATH = os.path.join(BASE_DIR, '.merge_work')
 DATA_SAVE_LOCK = threading.Lock()
 FACE_ATTRIBUTE_LOCK = threading.Lock()
 MERGE_JOB_LOCK = threading.Lock()
+MERGE_PROCESS_START_LOCK = threading.Lock()
 SONA_ACTIVE_ATTEMPTS = set()
 SONA_CREDIT_LOCKS = {}
 MERGE_JOBS = {}
 MERGE_JOB_BY_REQUEST = {}
-# 所有被试共享同一个四线程图片工作池；外层工作池只允许两名被试同时进入处理。
-MORPH_EXECUTOR = ThreadPoolExecutor(max_workers=GLOBAL_MORPH_WORKERS)
+MERGE_SESSION_CANCELLATIONS = {}
+# 仅一名被试进入处理；该被试的六组图片由最多四个可终止的子进程计算。
 PARTICIPANT_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ACTIVE_PARTICIPANTS)
 # SONA 网络请求不占用 Flask 请求线程，也不长期持有全体被试共用的保存锁。
 SONA_EXECUTOR = ThreadPoolExecutor(max_workers=2)
@@ -138,6 +145,7 @@ cv2.setNumThreads(1)
 os.makedirs(DATA_SAVE_PATH, exist_ok=True)
 os.makedirs(PARTICIPANT_FACES_PATH, exist_ok=True)
 os.makedirs(GENERATED_FACES_PATH, exist_ok=True)
+os.makedirs(MERGE_WORK_PATH, exist_ok=True)
 os.makedirs(os.path.join(DATABASE_PATH, 'male'), exist_ok=True)
 os.makedirs(os.path.join(DATABASE_PATH, 'female'), exist_ok=True)
 
@@ -146,24 +154,26 @@ detector = None
 predictor = None
 face_attribute_net = None
 FACE_ATTRIBUTE_MODEL_ERROR = ''
-try:
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(PREDICTOR_PATH)
-    print("[OK] Dlib models loaded successfully.")
-except Exception as e:
-    print(f"[ERROR] Dlib model could not be loaded from '{PREDICTOR_PATH}'.")
-    print(e)
+# 批量融合进程只使用已检测出的特征点，避免每个进程重复加载模型。
+if os.environ.get('_EXPERIMENT_MORPH_BATCH_WORKER') != '1':
+    try:
+        detector = dlib.get_frontal_face_detector()
+        predictor = dlib.shape_predictor(PREDICTOR_PATH)
+        print("[OK] Dlib models loaded successfully.")
+    except Exception as e:
+        print(f"[ERROR] Dlib model could not be loaded from '{PREDICTOR_PATH}'.")
+        print(e)
 
-try:
-    if not os.path.isfile(FACE_ATTRIBUTE_MODEL_PATH):
-        raise FileNotFoundError(
-            f"Face attribute model not found: {FACE_ATTRIBUTE_MODEL_PATH}"
-        )
-    face_attribute_net = cv2.dnn.readNetFromONNX(FACE_ATTRIBUTE_MODEL_PATH)
-    print("[OK] Face occlusion model loaded successfully.")
-except Exception as e:
-    FACE_ATTRIBUTE_MODEL_ERROR = str(e)
-    print(f"[ERROR] Face occlusion model could not be loaded: {e}")
+    try:
+        if not os.path.isfile(FACE_ATTRIBUTE_MODEL_PATH):
+            raise FileNotFoundError(
+                f"Face attribute model not found: {FACE_ATTRIBUTE_MODEL_PATH}"
+            )
+        face_attribute_net = cv2.dnn.readNetFromONNX(FACE_ATTRIBUTE_MODEL_PATH)
+        print("[OK] Face occlusion model loaded successfully.")
+    except Exception as e:
+        FACE_ATTRIBUTE_MODEL_ERROR = str(e)
+        print(f"[ERROR] Face occlusion model could not be loaded: {e}")
 
 # --- 核心图像处理函数 ---
 # 这些函数负责特征点检测、规范对齐、三角剖分、仿射变换和人脸融合。
@@ -1212,17 +1222,21 @@ def cleanup_merge_jobs_locked():
     expired_job_ids = [
         job_id
         for job_id, job in MERGE_JOBS.items()
-        if job.get("status") in ("completed", "failed")
+        if job.get("status") in ("completed", "failed", "cancelled")
         and job.get("finished_at", 0) < cutoff
     ]
     for job_id in expired_job_ids:
         job = MERGE_JOBS.pop(job_id)
         request_key = (
             job["participant_id"],
+            job["session_id"],
             job["request_fingerprint"]
         )
         if MERGE_JOB_BY_REQUEST.get(request_key) == job_id:
             del MERGE_JOB_BY_REQUEST[request_key]
+    for session_id, cancelled_at in list(MERGE_SESSION_CANCELLATIONS.items()):
+        if cancelled_at < cutoff:
+            del MERGE_SESSION_CANCELLATIONS[session_id]
 
 
 def get_merge_queue_position_locked(job_id):
@@ -1241,15 +1255,63 @@ def get_merge_queue_position_locked(job_id):
     return None
 
 
-def generate_merge_result(payload):
-    """生成一名被试的全部36张刺激图，并返回可直接序列化的结果。"""
+def prepare_merge_groups(payload):
+    """验证两张照片、AFA 对齐，并构建六组互不重叠的融合任务。"""
     participant_id = payload["participant_id"]
     self_gender = payload["self_gender"]
     partner_gender = payload["partner_gender"]
-    img_self_wide = payload["img_self_wide"]
-    img_partner_wide = payload["img_partner_wide"]
-    self_detected_points = payload["self_detected_points"]
-    partner_detected_points = payload["partner_detected_points"]
+    raw_self = base64_to_cv2(payload.get('self_image'))
+    raw_partner = base64_to_cv2(payload.get('partner_image'))
+    if raw_self is None or raw_partner is None:
+        raise MergePreparationError('Invalid images', 'INVALID_IMAGES', 400)
+
+    img_self_wide = crop_portrait_wide(raw_self)
+    img_partner_wide = crop_portrait_wide(raw_partner)
+    self_detected_points = get_points(img_self_wide)
+    partner_detected_points = get_points(img_partner_wide)
+    invalid_roles = []
+    if len(self_detected_points) < 68:
+        invalid_roles.append('your photograph')
+    if len(partner_detected_points) < 68:
+        invalid_roles.append("your partner's photograph")
+    if invalid_roles:
+        raise MergePreparationError(
+            'A clear face could not be detected in ' + ' and '.join(invalid_roles)
+            + '. Please use a front-facing photograph without glasses, '
+              'sunglasses, or face coverings, then try again.',
+            'FACE_QUALITY_ERROR', 422
+        )
+
+    try:
+        occlusion_checks = {
+            'self': assess_face_occlusion(img_self_wide, self_detected_points),
+            'partner': assess_face_occlusion(img_partner_wide, partner_detected_points)
+        }
+    except Exception as error:
+        raise MergePreparationError(
+            'The automated photograph check is temporarily unavailable. '
+            'Please ask the researcher to restart the experiment server.',
+            'FACE_OCCLUSION_CHECK_UNAVAILABLE', 503
+        ) from error
+    occlusion_issues = {
+        role: issues for role, (_, issues) in occlusion_checks.items() if issues
+    }
+    if occlusion_issues:
+        affected_roles = [
+            label for role, label in (
+                ('self', 'your photograph'),
+                ('partner', "your partner's photograph")
+            ) if role in occlusion_issues
+        ]
+        raise MergePreparationError(
+            'The photo requirements were not met for '
+            + ' and '.join(affected_roles)
+            + '. Please use a clear, well-lit, front-facing photograph '
+              'with a clean, uncluttered background. Remove glasses, '
+              'sunglasses, and face coverings, and keep a neutral '
+              'expression without smiling or making faces.',
+            'FACE_OCCLUSION_ERROR', 422, issues=occlusion_issues
+        )
 
     photo_batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     self_filename = save_uploaded_image(img_self_wide, photo_batch_id, "self")
@@ -1339,18 +1401,56 @@ def generate_merge_result(payload):
             })
             trial_id += 1
 
-    # 两名并发被试的刺激图都提交给同一个四线程池。每轮只提交4张，
-    # 避免先到被试一次占满队列，使稍后进入的第二名被试长期得不到线程。
-    result_images = []
-    for chunk_start in range(0, len(morph_jobs), GLOBAL_MORPH_WORKERS):
-        job_chunk = morph_jobs[
-            chunk_start:chunk_start + GLOBAL_MORPH_WORKERS
-        ]
-        morph_futures = [
-            MORPH_EXECUTOR.submit(build_morph_stimulus, job)
-            for job in job_chunk
-        ]
-        result_images.extend(future.result() for future in morph_futures)
+    return photo_batch_id, [morph_jobs[i:i + 6] for i in range(0, 36, 6)]
+
+
+class MergePreparationError(Exception):
+    def __init__(self, message, code, http_status, issues=None):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+        self.issues = issues
+
+
+def write_merge_worker_error(path, error):
+    with open(path, 'w', encoding='utf-8') as output:
+        json.dump({
+            'error': str(error),
+            'code': getattr(error, 'code', 'MERGE_PROCESSING_ERROR'),
+            'http_status': getattr(error, 'http_status', 500),
+            'issues': getattr(error, 'issues', None)
+        }, output)
+
+
+def prepare_merge_worker(payload, work_dir):
+    """独立进程：校验、对齐和分组，主进程可直接终止整个阶段。"""
+    try:
+        photo_batch_id, groups = prepare_merge_groups(payload)
+        for index, group in enumerate(groups):
+            with open(os.path.join(work_dir, f'group_{index}.pkl'), 'wb') as output:
+                pickle.dump(group, output, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(os.path.join(work_dir, 'prepared.json'), 'w', encoding='utf-8') as output:
+            json.dump({'photo_batch_id': photo_batch_id, 'group_count': len(groups)}, output)
+    except Exception as error:
+        traceback.print_exc()
+        write_merge_worker_error(os.path.join(work_dir, 'prepare_error.json'), error)
+
+
+def morph_group_worker(work_dir, index):
+    """独立 CPU 进程：一次只计算一个数据库身份的六个融合比例。"""
+    try:
+        with open(os.path.join(work_dir, f'group_{index}.pkl'), 'rb') as source:
+            group = pickle.load(source)
+        result = [build_morph_stimulus(job) for job in group]
+        with open(os.path.join(work_dir, f'result_{index}.json'), 'w', encoding='utf-8') as output:
+            json.dump(result, output)
+    except Exception as error:
+        traceback.print_exc()
+        write_merge_worker_error(os.path.join(work_dir, f'error_{index}.json'), error)
+
+
+def finalize_merge_result(participant_id, photo_batch_id, result_images):
+    """全部子进程退出后才确认结果、释放计算名额。"""
 
     self_images = [image for image in result_images if image.get("type") == "self_morph"]
     partner_images = [image for image in result_images if image.get("type") == "partner_morph"]
@@ -1376,33 +1476,207 @@ def generate_merge_result(payload):
     }
 
 
-def run_merge_job(job_id, payload):
-    """由双被试工作池调用；任务一开始就移除前端的排队状态。"""
-    with MERGE_JOB_LOCK:
-        job = MERGE_JOBS.get(job_id)
-        if job is None:
-            return
-        job["status"] = "processing"
-        job["started_at"] = time.time()
+class MergeJobCancelled(Exception):
+    pass
 
+
+def cancel_merge_job_locked(job_id):
+    """排队任务直接取消；运行任务须待子进程终止后才释放名额。"""
+    job = MERGE_JOBS.get(job_id)
+    if not job or job['status'] not in ('queued', 'processing'):
+        return
+    job['cancel_requested'] = True
+    if job['status'] == 'queued':
+        job['status'] = 'cancelled'
+        job['finished_at'] = time.time()
+        future = job.get('future')
+        if future is not None:
+            future.cancel()
+    request_key = (job['participant_id'], job['session_id'], job['request_fingerprint'])
+    if MERGE_JOB_BY_REQUEST.get(request_key) == job_id:
+        del MERGE_JOB_BY_REQUEST[request_key]
+
+
+def expire_merge_leases_locked():
+    now = time.time()
+    for job_id, job in MERGE_JOBS.items():
+        if job['status'] in ('queued', 'processing') and now - job['last_seen'] > MERGE_JOB_LEASE_SECONDS:
+            cancel_merge_job_locked(job_id)
+
+
+def merge_cancel_requested(job_id):
+    with MERGE_JOB_LOCK:
+        expire_merge_leases_locked()
+        job = MERGE_JOBS.get(job_id)
+        return job is None or job.get('cancel_requested', False)
+
+
+def stop_merge_process(process):
+    """子进程确认退出前不允许下一名被试开始。"""
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+    while process.is_alive():
+        process.kill()
+        process.join(timeout=1)
+    process.join()
+    process.close()
+
+
+def start_merge_process(process, batch=False):
+    """Windows spawn 在导入目标模块前尚未设置进程名，靠继承环境区分轻量批进程。"""
+    with MERGE_PROCESS_START_LOCK:
+        key = '_EXPERIMENT_MORPH_BATCH_WORKER'
+        previous = os.environ.get(key)
+        if batch:
+            os.environ[key] = '1'
+        else:
+            os.environ.pop(key, None)
+        try:
+            process.start()
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
+def read_merge_worker_result(work_dir, success_filename, error_filename):
+    error_path = os.path.join(work_dir, error_filename)
+    if os.path.isfile(error_path):
+        with open(error_path, encoding='utf-8') as source:
+            details = json.load(source)
+        raise MergePreparationError(
+            details.get('error', 'Face processing failed.'),
+            details.get('code', 'MERGE_PROCESSING_ERROR'),
+            details.get('http_status', 500),
+            details.get('issues')
+        )
+    success_path = os.path.join(work_dir, success_filename)
+    if not os.path.isfile(success_path):
+        raise RuntimeError('Face processing worker exited without a result.')
+    with open(success_path, encoding='utf-8') as source:
+        return json.load(source)
+
+
+def run_merge_job(job_id, payload):
+    """单名被试独占名额；预处理及六组合成都运行于可终止的进程。"""
+    with MERGE_JOB_LOCK:
+        expire_merge_leases_locked()
+        job = MERGE_JOBS.get(job_id)
+        if job is None or job['status'] != 'queued' or job.get('cancel_requested'):
+            return
+        job['status'] = 'processing'
+        job['started_at'] = time.time()
+
+    processes = set()
+    work_dir = None
     try:
-        result = generate_merge_result(payload)
+        context = multiprocessing.get_context('spawn')
+        # Windows 取消时文件可能仍被工作进程占用；先杀停进程，再二次清理临时目录。
+        with tempfile.TemporaryDirectory(
+            prefix=f'job_{job_id}_', dir=MERGE_WORK_PATH, ignore_cleanup_errors=True
+        ) as work_dir:
+            if os.path.commonpath([os.path.abspath(MERGE_WORK_PATH), os.path.abspath(work_dir)]) != os.path.abspath(MERGE_WORK_PATH):
+                raise RuntimeError('Unexpected merge work directory.')
+            if merge_cancel_requested(job_id):
+                raise MergeJobCancelled()
+
+            preparation = context.Process(
+                target=prepare_merge_worker, args=(payload, work_dir), name='MorphPrepare', daemon=True
+            )
+            start_merge_process(preparation)
+            processes.add(preparation)
+            while preparation.is_alive():
+                if merge_cancel_requested(job_id):
+                    raise MergeJobCancelled()
+                preparation.join(timeout=MERGE_POLL_INTERVAL_SECONDS)
+            preparation.join()
+            processes.remove(preparation)
+            exit_code = preparation.exitcode
+            preparation.close()
+            if merge_cancel_requested(job_id):
+                raise MergeJobCancelled()
+            if exit_code != 0 and not os.path.isfile(os.path.join(work_dir, 'prepare_error.json')):
+                raise RuntimeError(f'Photo preparation process exited ({exit_code}).')
+            prepared = read_merge_worker_result(work_dir, 'prepared.json', 'prepare_error.json')
+            if prepared.get('group_count') != 6:
+                raise RuntimeError('Photo preparation did not produce six face groups.')
+
+            pending = iter(range(6))
+            running = {}
+            result_images = []
+            while running or pending is not None:
+                if merge_cancel_requested(job_id):
+                    raise MergeJobCancelled()
+                while pending is not None and len(running) < GLOBAL_MORPH_WORKERS:
+                    index = next(pending, None)
+                    if index is None:
+                        pending = None
+                        break
+                    process = context.Process(
+                        target=morph_group_worker,
+                        args=(work_dir, index),
+                        name=f'MorphBatch-{index}',
+                        daemon=True
+                    )
+                    start_merge_process(process, batch=True)
+                    processes.add(process)
+                    running[index] = process
+                if not running:
+                    continue
+                next(iter(running.values())).join(timeout=MERGE_POLL_INTERVAL_SECONDS)
+                for index, process in list(running.items()):
+                    if process.is_alive():
+                        continue
+                    process.join()
+                    processes.remove(process)
+                    exit_code = process.exitcode
+                    process.close()
+                    del running[index]
+                    if merge_cancel_requested(job_id):
+                        raise MergeJobCancelled()
+                    if exit_code != 0 and not os.path.isfile(os.path.join(work_dir, f'error_{index}.json')):
+                        raise RuntimeError(f'Face processing worker exited ({exit_code}).')
+                    result_images.extend(read_merge_worker_result(
+                        work_dir, f'result_{index}.json', f'error_{index}.json'
+                    ))
+            result = finalize_merge_result(payload['participant_id'], prepared['photo_batch_id'], result_images)
+
+        with MERGE_JOB_LOCK:
+            job = MERGE_JOBS.get(job_id)
+            if job is not None:
+                if job.get('cancel_requested') or time.time() - job['last_seen'] > MERGE_JOB_LEASE_SECONDS:
+                    job['status'] = 'cancelled'
+                else:
+                    job['status'] = 'completed'
+                    job['result'] = result
+                job['finished_at'] = time.time()
+    except MergeJobCancelled:
+        with MERGE_JOB_LOCK:
+            job = MERGE_JOBS.get(job_id)
+            if job is not None:
+                job['status'] = 'cancelled'
+                job['finished_at'] = time.time()
     except Exception as error:
         traceback.print_exc()
         with MERGE_JOB_LOCK:
             job = MERGE_JOBS.get(job_id)
             if job is not None:
-                job["status"] = "failed"
-                job["error"] = str(error)
-                job["finished_at"] = time.time()
-        return
-
-    with MERGE_JOB_LOCK:
-        job = MERGE_JOBS.get(job_id)
-        if job is not None:
-            job["status"] = "completed"
-            job["result"] = result
-            job["finished_at"] = time.time()
+                job['status'] = 'failed'
+                job['error'] = str(error)
+                job['code'] = getattr(error, 'code', 'MERGE_PROCESSING_ERROR')
+                job['http_status'] = getattr(error, 'http_status', 500)
+                job['issues'] = getattr(error, 'issues', None)
+                job['finished_at'] = time.time()
+    finally:
+        for process in processes:
+            stop_merge_process(process)
+        if work_dir and os.path.isdir(work_dir):
+            work_root = os.path.abspath(MERGE_WORK_PATH)
+            work_target = os.path.abspath(work_dir)
+            if os.path.commonpath([work_root, work_target]) == work_root:
+                shutil.rmtree(work_target, ignore_errors=True)
 
 
 def merge_job_response(job_id):
@@ -1426,8 +1700,12 @@ def merge_job_response(job_id):
                 "status": "failed",
                 "job_id": job_id,
                 "error": job.get("error", "Face processing failed."),
-                "code": "MERGE_PROCESSING_ERROR"
+                "code": job.get('code', 'MERGE_PROCESSING_ERROR'),
+                "http_status": job.get('http_status', 500),
+                "issues": job.get('issues')
             }
+        if status == 'cancelled':
+            return {'status': 'cancelled', 'job_id': job_id, 'error': 'Face processing was cancelled.'}
         return {"job_id": job_id, **job["result"]}
 
 # --- 核心路由: 图片融合处理 ---
@@ -1442,8 +1720,16 @@ def process_images_experiment():
         if not re.fullmatch(r'^P_[A-Za-z0-9_-]{3,96}$', participant_id):
             return jsonify({"error": "Invalid participant ID"}), 400
 
+        session_id = str(data.get('merge_session_id') or '').strip()
+        if not re.fullmatch(r'^[a-f0-9]{32}$', session_id):
+            return jsonify({'error': 'Invalid merge session ID'}), 400
+        if not isinstance(data.get('self_image'), str) or not isinstance(data.get('partner_image'), str):
+            return jsonify({'error': 'Two photographs are required.'}), 400
+
         self_gender = data.get('self_gender', 'male')
         partner_gender = data.get('partner_gender', 'female')
+        if self_gender not in ('male', 'female') or partner_gender not in ('male', 'female'):
+            return jsonify({'error': 'Invalid photo gender selection.'}), 400
         request_fingerprint = hashlib.sha256(
             (
                 f"{self_gender}|{partner_gender}|"
@@ -1451,96 +1737,22 @@ def process_images_experiment():
                 f"{data.get('partner_image') or ''}"
             ).encode('utf-8')
         ).hexdigest()
-        raw_self = base64_to_cv2(data.get('self_image'))
-        raw_partner = base64_to_cv2(data.get('partner_image'))
-        
-        if raw_self is None or raw_partner is None:
-            return jsonify({"error": "Invalid images"}), 400
-
-        img_self_wide = crop_portrait_wide(raw_self)
-        img_partner_wide = crop_portrait_wide(raw_partner)
-
-        # 上传照片的关键点只计算一次，供全部融合比例复用。
-        self_detected_points = get_points(img_self_wide)
-        partner_detected_points = get_points(img_partner_wide)
-
-        invalid_roles = []
-        if len(self_detected_points) < 68:
-            invalid_roles.append("your photograph")
-        if len(partner_detected_points) < 68:
-            invalid_roles.append("your partner's photograph")
-
-        if invalid_roles:
-            return jsonify({
-                "error": (
-                    "A clear face could not be detected in "
-                    + " and ".join(invalid_roles)
-                    + ". Please use a front-facing photograph without glasses, "
-                      "sunglasses, or face coverings, then try again."
-                ),
-                "code": "FACE_QUALITY_ERROR"
-            }), 422
-
-        try:
-            occlusion_checks = {
-                'self': assess_face_occlusion(
-                    img_self_wide,
-                    self_detected_points
-                ),
-                'partner': assess_face_occlusion(
-                    img_partner_wide,
-                    partner_detected_points
-                )
-            }
-        except Exception as e:
-            print(f"Face occlusion check failed: {e}")
-            return jsonify({
-                "error": (
-                    "The automated photograph check is temporarily unavailable. "
-                    "Please ask the researcher to restart the experiment server."
-                ),
-                "code": "FACE_OCCLUSION_CHECK_UNAVAILABLE"
-            }), 503
-
-        occlusion_issues = {
-            role: issues
-            for role, (_, issues) in occlusion_checks.items()
-            if issues
-        }
-        if occlusion_issues:
-            affected_roles = []
-            if 'self' in occlusion_issues:
-                affected_roles.append("your photograph")
-            if 'partner' in occlusion_issues:
-                affected_roles.append("your partner's photograph")
-            return jsonify({
-                "error": (
-                    "The photo requirements were not met for "
-                    + " and ".join(affected_roles)
-                    + ". Please use a clear, well-lit, front-facing photograph "
-                      "with a clean, uncluttered background. Remove glasses, "
-                      "sunglasses, and face coverings, and keep a neutral "
-                      "expression without smiling or making faces."
-                ),
-                "code": "FACE_OCCLUSION_ERROR",
-                "issues": occlusion_issues
-            }), 422
-
         payload = {
             "participant_id": participant_id,
             "self_gender": self_gender,
             "partner_gender": partner_gender,
-            "img_self_wide": img_self_wide,
-            "img_partner_wide": img_partner_wide,
-            "self_detected_points": self_detected_points,
-            "partner_detected_points": partner_detected_points
+            "self_image": data['self_image'],
+            "partner_image": data['partner_image']
         }
 
         # 后端防重复：同一被试提交相同两张照片时复用原任务；重新上传
         # 不同照片则创建新任务，保证最终使用的是最后确认的照片。
         with MERGE_JOB_LOCK:
             cleanup_merge_jobs_locked()
-            request_key = (participant_id, request_fingerprint)
+            expire_merge_leases_locked()
+            if session_id in MERGE_SESSION_CANCELLATIONS:
+                return jsonify({'error': 'This page session was closed.'}), 410
+            request_key = (participant_id, session_id, request_fingerprint)
             existing_job_id = MERGE_JOB_BY_REQUEST.get(request_key)
             existing_job = (
                 MERGE_JOBS.get(existing_job_id)
@@ -1557,12 +1769,19 @@ def process_images_experiment():
                 job_id = uuid.uuid4().hex
                 MERGE_JOBS[job_id] = {
                     "participant_id": participant_id,
+                    "session_id": session_id,
                     "request_fingerprint": request_fingerprint,
                     "status": "queued",
-                    "created_at": time.time()
+                    "created_at": time.time(),
+                    "last_seen": time.time()
                 }
                 MERGE_JOB_BY_REQUEST[request_key] = job_id
-                PARTICIPANT_EXECUTOR.submit(run_merge_job, job_id, payload)
+                try:
+                    MERGE_JOBS[job_id]['future'] = PARTICIPANT_EXECUTOR.submit(run_merge_job, job_id, payload)
+                except Exception:
+                    del MERGE_JOBS[job_id]
+                    del MERGE_JOB_BY_REQUEST[request_key]
+                    raise
 
         response_body = merge_job_response(job_id)
         if response_body is None:
@@ -1579,14 +1798,42 @@ def get_merge_status(job_id):
     if not re.fullmatch(r'^[a-f0-9]{32}$', job_id):
         return jsonify({"error": "Invalid merge job ID"}), 400
 
+    session_id = request.headers.get('X-Merge-Session', '')
+    with MERGE_JOB_LOCK:
+        job = MERGE_JOBS.get(job_id)
+        if job is None or job.get('session_id') != session_id:
+            return jsonify({'error': 'Merge job not found.'}), 404
+        expire_merge_leases_locked()
+        if job['status'] in ('queued', 'processing') and not job.get('cancel_requested'):
+            job['last_seen'] = time.time()
+
     response_body = merge_job_response(job_id)
     if response_body is None:
         return jsonify({"error": "Merge job not found or expired"}), 404
     response = jsonify(response_body)
     response.headers['Cache-Control'] = 'no-store'
     if response_body["status"] == "failed":
-        return response, 500
+        return response, response_body.get('http_status', 500)
+    if response_body['status'] == 'cancelled':
+        return response, 410
     return response
+
+
+@app.route('/merge_cancel', methods=['POST'])
+def cancel_merge_session():
+    """关闭页面的尽力通知；失联租约是该通知未送达时的兜底。"""
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid cancellation request.'}), 400
+    session_id = str(data.get('merge_session_id') or '').strip()
+    if not re.fullmatch(r'^[a-f0-9]{32}$', session_id):
+        return jsonify({'error': 'Invalid merge session ID.'}), 400
+    with MERGE_JOB_LOCK:
+        MERGE_SESSION_CANCELLATIONS[session_id] = time.time()
+        for job_id, job in MERGE_JOBS.items():
+            if job['session_id'] == session_id:
+                cancel_merge_job_locked(job_id)
+    return jsonify({'status': 'cancellation_requested'})
 
 # --- 删除被试照片 ---
 @app.route('/delete_participant_faces', methods=['POST'])
