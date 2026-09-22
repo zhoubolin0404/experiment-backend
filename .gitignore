@@ -18,6 +18,7 @@ data/
 
 # Licensed/runtime image assets are provisioned on the deployment machine
 database/
+database_preprocessed/
 AMFD Faces Final/
 shape_predictor_68_face_landmarks.dat
 models/*.onnx

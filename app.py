@@ -20,12 +20,12 @@ import uuid
 import multiprocessing
 import pickle
 import tempfile
+from zipfile import BadZipFile
 import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 
 app = Flask(__name__)
 
@@ -64,6 +64,8 @@ FACE_ATTRIBUTE_MODEL_PATH = os.path.join(
     'face_attrib_net.onnx'
 )
 DATABASE_PATH = os.path.join(BASE_DIR, 'database')
+PREPROCESSED_DATABASE_PATH = os.path.join(BASE_DIR, 'database_preprocessed')
+DATABASE_PREPROCESS_VERSION = 1  # 修改数据库裁剪/关键点规则时同步提升版本并重建。
 PARTICIPANT_FACES_PATH = os.path.join(BASE_DIR, 'participant_faces')
 GENERATED_FACES_PATH = os.path.join(BASE_DIR, 'generated_faces')
 DATA_SAVE_PATH = os.path.join(BASE_DIR, 'data')
@@ -1021,25 +1023,110 @@ def save_uploaded_image(image, photo_batch_id, role):
         raise IOError(f"Failed to save participant photograph: {role}")
     return f"{photo_batch_id}/{filename}"
 
-@lru_cache(maxsize=256)
-def load_prepared_db_image(filepath):
-    """缓存样本库规范头像及AFA需要的68个人脸关键点。"""
-    img = cv2.imread(filepath)
-    if img is None:
-        raise ValueError(f"Cannot read database image: {filepath}")
-    img_resized = crop_portrait_wide(img)
-    if img_resized is None:
-        img_resized = cv2.resize(img, (PROCESS_WIDTH, PROCESS_HEIGHT))
-    detected_points = get_points(img_resized)
-    if len(detected_points) < 68:
-        raise ValueError("A clear face could not be detected in database image.")
-    return img_resized, detected_points[:68]
+class PreprocessedDatabaseError(RuntimeError):
+    code = 'DATABASE_PREPROCESSING_ERROR'
+    http_status = 503
 
-def get_random_original_db_images(gender, count=3, excluded_filenames=None):
-    """随机选取指定数量的不重复同性数据库面孔，并完成裁剪和关键点预处理。"""
+
+def database_source_files(gender):
+    """只使用原实验规则指定的 male/female jpg、png，不包含 face_select。"""
     folder = 'male' if gender == 'male' else 'female'
     path = os.path.join(DATABASE_PATH, folder)
-    all_files = glob.glob(os.path.join(path, "*.jpg")) + glob.glob(os.path.join(path, "*.png"))
+    return sorted(
+        glob.glob(os.path.join(path, '*.jpg'))
+        + glob.glob(os.path.join(path, '*.png'))
+    )
+
+
+def database_source_key(filepath):
+    return os.path.relpath(filepath, DATABASE_PATH).replace(os.sep, '/')
+
+
+def database_file_sha256(filepath):
+    digest = hashlib.sha256()
+    with open(filepath, 'rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_preprocessed_database_manifest():
+    """只验证离线结果与源图一致；实验运行时绝不重算数据库关键点。"""
+    rebuild_message = (
+        'Database face preprocessing is missing or outdated. Stop the server '
+        'and run: python preprocess_database.py'
+    )
+    manifest_path = os.path.join(PREPROCESSED_DATABASE_PATH, 'manifest.json')
+    try:
+        with open(manifest_path, encoding='utf-8') as source:
+            manifest = json.load(source)
+        predictor_stat = os.stat(PREDICTOR_PATH)
+        if (
+            manifest.get('version') != DATABASE_PREPROCESS_VERSION
+            or manifest.get('width') != PROCESS_WIDTH
+            or manifest.get('height') != PROCESS_HEIGHT
+            or manifest.get('predictor_size') != predictor_stat.st_size
+            or manifest.get('predictor_mtime_ns') != predictor_stat.st_mtime_ns
+        ):
+            raise ValueError('Preprocessing settings or landmark model changed.')
+        entries = manifest['faces']
+        if not isinstance(entries, dict):
+            raise ValueError('Invalid face manifest.')
+        current_files = database_source_files('male') + database_source_files('female')
+        if set(entries) != {database_source_key(path) for path in current_files}:
+            raise ValueError('Database face files changed.')
+        for filepath in current_files:
+            entry = entries[database_source_key(filepath)]
+            stat = os.stat(filepath)
+            if (
+                not isinstance(entry, dict)
+                or entry.get('source_size') != stat.st_size
+                or entry.get('source_mtime_ns') != stat.st_mtime_ns
+            ):
+                raise ValueError(f'Database face changed: {os.path.basename(filepath)}')
+        return entries
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise PreprocessedDatabaseError(f'{rebuild_message} ({error})') from error
+
+
+def load_prepared_db_image(filepath, entries):
+    """从脚本生成的持久化文件读取规范头像及68点，不再检测数据库人脸。"""
+    key = database_source_key(filepath)
+    entry = entries.get(key)
+    if not isinstance(entry, dict) or not entry.get('valid'):
+        raise PreprocessedDatabaseError(f'Database face is not preprocessed: {key}')
+    rebuild_message = f'Invalid preprocessed database face {key}; run python preprocess_database.py'
+    try:
+        if database_file_sha256(filepath) != entry['source_sha256']:
+            raise ValueError('Source image content changed.')
+        root = os.path.abspath(PREPROCESSED_DATABASE_PATH)
+        artifact = entry['artifact']
+        if not isinstance(artifact, str) or not artifact.endswith('.npz'):
+            raise ValueError('Invalid preprocessed artifact name.')
+        artifact_path = os.path.abspath(os.path.join(root, artifact))
+        if os.path.commonpath([root, artifact_path]) != root:
+            raise ValueError('Invalid preprocessed artifact path.')
+        if database_file_sha256(artifact_path) != entry['artifact_sha256']:
+            raise ValueError('Preprocessed artifact content changed.')
+        with np.load(artifact_path, allow_pickle=False) as prepared:
+            image = prepared['image'].copy()
+            points = prepared['points'].copy()
+        if (
+            image.shape != (PROCESS_HEIGHT, PROCESS_WIDTH, 3)
+            or image.dtype != np.uint8
+            or points.shape != (68, 2)
+            or not np.isfinite(points).all()
+        ):
+            raise ValueError('Invalid preprocessed image or landmark geometry.')
+        return image, points
+    except (OSError, ValueError, KeyError, TypeError, EOFError, BadZipFile) as error:
+        raise PreprocessedDatabaseError(f'{rebuild_message} ({error})') from error
+
+
+def get_random_original_db_images(gender, count=3, excluded_filenames=None, preprocessed_entries=None):
+    """按原规则随机选同性数据库身份，直接加载脚本生成的有效预处理文件。"""
+    entries = preprocessed_entries if preprocessed_entries is not None else load_preprocessed_database_manifest()
+    all_files = database_source_files(gender)
     original_files = [
         filepath
         for filepath in all_files
@@ -1055,26 +1142,17 @@ def get_random_original_db_images(gender, count=3, excluded_filenames=None):
         filepath
         for filepath in original_files
         if os.path.basename(filepath) not in excluded_filenames
+        and entries[database_source_key(filepath)].get('valid') is True
     ]
     random.shuffle(candidates)
     selected_images = []
-    for selected_file in candidates:
-        try:
-            img_resized, detected_points = load_prepared_db_image(
-                selected_file
-            )
-            selected_images.append((
-                img_resized,
-                os.path.basename(selected_file),
-                detected_points
-            ))
-            if len(selected_images) == count:
-                break
-        except Exception as e:
-            print(
-                f"Skipping database face {os.path.basename(selected_file)}: {e}"
-            )
-            continue
+    for selected_file in candidates[:count]:
+        img_resized, detected_points = load_prepared_db_image(selected_file, entries)
+        selected_images.append((
+            img_resized,
+            os.path.basename(selected_file),
+            detected_points
+        ))
     return selected_images
 
 
@@ -1324,7 +1402,10 @@ def prepare_merge_groups(payload):
 
     # 本人和伴侣各自固定使用 3 个同性数据库面孔；同一面孔覆盖全部 6 个比例。
     # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
-    self_db_faces = get_random_original_db_images(self_gender, count=3)
+    preprocessed_entries = load_preprocessed_database_manifest()
+    self_db_faces = get_random_original_db_images(
+        self_gender, count=3, preprocessed_entries=preprocessed_entries
+    )
     partner_excluded_filenames = (
         {db_filename for _, db_filename, _ in self_db_faces}
         if self_gender == partner_gender
@@ -1333,7 +1414,8 @@ def prepare_merge_groups(payload):
     partner_db_faces = get_random_original_db_images(
         partner_gender,
         count=3,
-        excluded_filenames=partner_excluded_filenames
+        excluded_filenames=partner_excluded_filenames,
+        preprocessed_entries=preprocessed_entries
     )
     if len(self_db_faces) < 3 or len(partner_db_faces) < 3:
         raise RuntimeError(
