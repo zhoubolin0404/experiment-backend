@@ -75,11 +75,15 @@ MERGE_JOB_TTL_SECONDS = 30 * 60
 DATA_SAVE_LOCK = threading.Lock()
 FACE_ATTRIBUTE_LOCK = threading.Lock()
 MERGE_JOB_LOCK = threading.Lock()
+SONA_ACTIVE_ATTEMPTS = set()
+SONA_CREDIT_LOCKS = {}
 MERGE_JOBS = {}
 MERGE_JOB_BY_REQUEST = {}
 # 所有被试共享同一个四线程图片工作池；外层工作池只允许两名被试同时进入处理。
 MORPH_EXECUTOR = ThreadPoolExecutor(max_workers=GLOBAL_MORPH_WORKERS)
 PARTICIPANT_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ACTIVE_PARTICIPANTS)
+# SONA 网络请求不占用 Flask 请求线程，也不长期持有全体被试共用的保存锁。
+SONA_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 SONA_COMPLETION_API_URL = os.environ.get(
     'SONA_COMPLETION_API_URL',
     'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
@@ -1347,6 +1351,22 @@ def generate_merge_result(payload):
             for job in job_chunk
         ]
         result_images.extend(future.result() for future in morph_futures)
+
+    self_images = [image for image in result_images if image.get("type") == "self_morph"]
+    partner_images = [image for image in result_images if image.get("type") == "partner_morph"]
+    if (
+        len(result_images) != 36
+        or len(self_images) != 18
+        or len(partner_images) != 18
+        or any(
+            not isinstance(image.get("url"), str)
+            or not image["url"].startswith("data:image/jpeg;base64,")
+            or len(image["url"]) <= len("data:image/jpeg;base64,")
+            for image in result_images
+        )
+    ):
+        raise RuntimeError("Face processing did not produce all 36 valid images.")
+
     random.shuffle(result_images)
     return {
         "status": "completed",
@@ -1741,7 +1761,7 @@ def _write_json_atomically(json_filepath, data):
 
 
 def _build_experiment_json_file_info(data, is_complete):
-    """生成会话的临时文件名、最终文件名和最终文件搜索模式。"""
+    """按稳定被试编号为一次实验生成唯一文件名，自动/最终保存共用。"""
     raw_sona_id = str(data.get('sona_id') or 'sona').strip() or 'sona'
     safe_sona_id = re.sub(r'[^A-Za-z0-9._-]+', '_', raw_sona_id)
     safe_sona_id = (safe_sona_id.strip('._-')[:128] or 'sona')
@@ -1756,17 +1776,7 @@ def _build_experiment_json_file_info(data, is_complete):
         end_timestamp = datetime.now().strftime('%Y%m%d%H%M')
     data['file_end_timestamp'] = end_timestamp if is_complete else ''
 
-    filename_prefix = f"{safe_sona_id}_{start_timestamp}"
-    incomplete_filename = f"{filename_prefix}_incomplete.json"
-    json_filename = (
-        f"{filename_prefix}_{end_timestamp}.json"
-        if is_complete
-        else incomplete_filename
-    )
-    final_filename_pattern = (
-        f"{filename_prefix}_{'[0-9]' * 12}.json"
-    )
-    return json_filename, incomplete_filename, final_filename_pattern
+    return f"sona_{safe_sona_id}_{start_timestamp}_{data['participant_id']}.json"
 
 
 def _read_json_record(json_filepath):
@@ -1777,6 +1787,102 @@ def _read_json_record(json_filepath):
             return json.load(existing_file)
     except (OSError, ValueError):
         return None
+
+
+def _sona_state_locked(record, json_filepath):
+    """从落盘记录和本进程中的授权任务判断当前状态；调用方必须持锁。"""
+    if not isinstance(record, dict):
+        return 'not_found'
+    if record.get('is_complete') is not True:
+        return 'partial'
+    completion = record.get('sona_completion')
+    if isinstance(completion, dict) and completion.get('success') is True:
+        return 'success'
+    if isinstance(completion, dict) and completion.get('status') == 'pending':
+        return 'pending' if json_filepath in SONA_ACTIVE_ATTEMPTS else 'unknown'
+    return 'failed' if completion else 'unknown'
+
+
+def _save_status_body_locked(record, json_filepath):
+    """仅公开保存/授权状态，不返回问卷答案或 SONA 令牌。"""
+    state = _sona_state_locked(record, json_filepath)
+    body = {'status': state, 'json_saved': state != 'not_found'}
+    if isinstance(record, dict):
+        body['json_filename'] = os.path.basename(json_filepath)
+        completion = record.get('sona_completion')
+        if isinstance(completion, dict) and state in ('success', 'failed'):
+            body['sona_completion'] = completion
+    return body
+
+
+def _grant_sona_credit_in_background(json_filepath, survey_code, attempt_id):
+    """SONA 请求完成后，只更新已保存的同一份最终 JSON。"""
+    try:
+        try:
+            # 同一 SONA 编号即使在两个标签页形成不同 respond_id，也不并发请求 SONA。
+            credit_key = str(survey_code or '').strip() or json_filepath
+            with DATA_SAVE_LOCK:
+                credit_lock = SONA_CREDIT_LOCKS.setdefault(
+                    credit_key, threading.Lock()
+                )
+            with credit_lock:
+                completion = grant_sona_credit(survey_code)
+        except Exception as error:
+            traceback.print_exc()
+            completion = {
+                'success': False,
+                'status': 'connection_error',
+                'message': f'SONA confirmation failed: {error}'
+            }
+        completion['attempted_at'] = datetime.now().isoformat()
+
+        with DATA_SAVE_LOCK:
+            current = _read_json_record(json_filepath)
+            pending = (
+                current.get('sona_completion')
+                if isinstance(current, dict)
+                else None
+            )
+            if (
+                isinstance(pending, dict)
+                and pending.get('status') == 'pending'
+                and pending.get('attempt_id') == attempt_id
+            ):
+                current['sona_completion'] = completion
+                _write_json_atomically(json_filepath, current)
+    except Exception:
+        traceback.print_exc()
+        # 如写回失败，磁盘中的 pending 会在下一次状态查询时显示为 unknown。
+    finally:
+        with DATA_SAVE_LOCK:
+            SONA_ACTIVE_ATTEMPTS.discard(json_filepath)
+
+
+@app.route('/save_status', methods=['POST'])
+def get_save_status():
+    identity = request.get_json(silent=True)
+    if not isinstance(identity, dict):
+        return jsonify({'error': 'Invalid JSON request body'}), 400
+
+    participant_id = str(identity.get('participant_id') or '').strip()
+    start_timestamp = str(identity.get('file_start_timestamp') or '').strip()
+    if (
+        not re.fullmatch(r'^P_[A-Za-z0-9_-]{3,96}$', participant_id)
+        or not re.fullmatch(r'^\d{12}$', start_timestamp)
+    ):
+        return jsonify({'error': 'Invalid save identity'}), 400
+
+    identity['participant_id'] = participant_id
+    json_filename = _build_experiment_json_file_info(identity, False)
+    json_filepath = os.path.join(DATA_SAVE_PATH, json_filename)
+    with DATA_SAVE_LOCK:
+        body = _save_status_body_locked(
+            _read_json_record(json_filepath), json_filepath
+        )
+
+    response = jsonify(body)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 # --- 核心路由: 数据保存 ---
 @app.route('/save_data', methods=['POST'])
@@ -1802,56 +1908,13 @@ def save_data():
         data['save_revision'] = save_revision
         is_complete = data.get('is_complete', False)
         
-        # 1. JSON 是最终数据的主记录。采用锁和原子替换，避免自动保存与最终保存并发写坏文件。
-        (
-            json_filename,
-            incomplete_filename,
-            final_filename_pattern
-        ) = _build_experiment_json_file_info(data, is_complete)
+        # 一次实验只用一个JSON文件；最终保存先落盘，SONA 在后台确认。
+        json_filename = _build_experiment_json_file_info(data, is_complete)
         json_filepath = os.path.join(DATA_SAVE_PATH, json_filename)
-        incomplete_filepath = os.path.join(
-            DATA_SAVE_PATH,
-            incomplete_filename
-        )
         with DATA_SAVE_LOCK:
             existing_data = _read_json_record(json_filepath)
-            if is_complete and existing_data is None:
-                existing_data = _read_json_record(incomplete_filepath)
-
-            # 最终文件与自动保存文件名不同，因此需显式检查同一参与者是否已经完成。
-            if not is_complete:
-                final_search_path = os.path.join(
-                    DATA_SAVE_PATH,
-                    final_filename_pattern
-                )
-                for completed_filepath in glob.glob(final_search_path):
-                    completed_data = _read_json_record(completed_filepath)
-                    if (
-                        isinstance(completed_data, dict) and
-                        completed_data.get('is_complete') is True and
-                        str(completed_data.get('participant_id', '')) ==
-                        str(participant_id)
-                    ):
-                        existing_data = completed_data
-                        break
-
-            # 如果上一次最终请求已经成功授予 credit，重试时直接复用结果，
-            # 避免因前端未收到响应而重复请求 SONA。
-            if is_complete and isinstance(existing_data, dict):
-                existing_sona = existing_data.get('sona_completion', {})
-                if (
-                    existing_sona.get('success') is True and
-                    str(existing_data.get('sona_id', '')).strip() ==
-                    str(data.get('sona_id', '')).strip()
-                ):
-                    data['sona_completion'] = existing_sona
 
             # 已经完成的记录不能被稍后到达的旧自动保存请求降级覆盖。
-            preserve_completed_record = (
-                isinstance(existing_data, dict) and
-                existing_data.get('is_complete') is True and
-                not is_complete
-            )
             try:
                 existing_revision = int(
                     existing_data.get('save_revision', 0)
@@ -1860,48 +1923,63 @@ def save_data():
                 )
             except (TypeError, ValueError):
                 existing_revision = 0
-            preserve_newer_partial = (
-                not is_complete and existing_revision > save_revision
-            )
 
-            if not preserve_completed_record and not preserve_newer_partial:
-                _write_json_atomically(json_filepath, data)
-                if (
-                    is_complete and
-                    incomplete_filepath != json_filepath and
-                    os.path.isfile(incomplete_filepath)
-                ):
-                    os.remove(incomplete_filepath)
-
-        sona_completion = data.get('sona_completion')
-        if is_complete and not (
-            isinstance(sona_completion, dict) and
-            sona_completion.get('success') is True
-        ):
-            sona_completion = grant_sona_credit(data.get('sona_id'))
-            sona_completion['attempted_at'] = datetime.now().isoformat()
-            data['sona_completion'] = sona_completion
-            # 无论成功或失败都记录结果，便于审计，并允许下次点击继续重试。
-            with DATA_SAVE_LOCK:
-                _write_json_atomically(json_filepath, data)
-
-        response_body = {
-            "status": "success",
-            "participant_id": participant_id,
-            "save_revision": save_revision,
-            "json_filename": json_filename,
-            "json_saved": True
-        }
-        if is_complete:
-            response_body["sona_completion"] = sona_completion
-            if not sona_completion.get('success'):
-                response_body["status"] = "data_saved_sona_pending"
-                response_body["error"] = (
-                    "Experiment data was saved, but SONA completion failed: "
-                    + sona_completion.get('message', 'Unknown SONA error')
+            if not is_complete:
+                preserve_existing = (
+                    isinstance(existing_data, dict)
+                    and (
+                        existing_data.get('is_complete') is True
+                        or existing_revision > save_revision
+                    )
                 )
-                return jsonify(response_body), 502
-        return jsonify(response_body)
+                if not preserve_existing:
+                    _write_json_atomically(json_filepath, data)
+                return jsonify({
+                    'status': 'success',
+                    'participant_id': participant_id,
+                    'save_revision': save_revision,
+                    'json_filename': json_filename,
+                    'json_saved': True
+                })
+
+            if isinstance(existing_data, dict) and existing_data.get('is_complete') is True:
+                # 重试不改写之前已保存的正式答案；成功授权直接复用落盘结果。
+                if str(existing_data.get('sona_id', '')).strip() != str(data.get('sona_id', '')).strip():
+                    return jsonify({'error': 'SONA identity changed for this experiment.'}), 409
+                state = _sona_state_locked(existing_data, json_filepath)
+                if state in ('success', 'pending'):
+                    return jsonify(_save_status_body_locked(existing_data, json_filepath)), (
+                        200 if state == 'success' else 202
+                    )
+                # 失败或后台进程中断后，只接受先查状态再明确发起的重试。
+                if data.get('retry_sona_credit') is not True:
+                    return jsonify(_save_status_body_locked(existing_data, json_filepath)), 200
+                data = existing_data
+            elif existing_revision > save_revision:
+                return jsonify({'error': 'A newer experiment revision is already saved.'}), 409
+
+            attempt_id = uuid.uuid4().hex
+            data['sona_completion'] = {
+                'success': False,
+                'status': 'pending',
+                'attempt_id': attempt_id,
+                'message': 'SONA credit confirmation is in progress.'
+            }
+            if json_filepath not in SONA_ACTIVE_ATTEMPTS:
+                _write_json_atomically(json_filepath, data)
+                SONA_ACTIVE_ATTEMPTS.add(json_filepath)
+                try:
+                    SONA_EXECUTOR.submit(
+                        _grant_sona_credit_in_background,
+                        json_filepath,
+                        data.get('sona_id'),
+                        attempt_id
+                    )
+                except Exception:
+                    SONA_ACTIVE_ATTEMPTS.discard(json_filepath)
+                    raise
+
+            return jsonify(_save_status_body_locked(data, json_filepath)), 202
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
