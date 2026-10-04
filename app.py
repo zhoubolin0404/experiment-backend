@@ -1161,7 +1161,7 @@ def align_afa_stimulus_group(
     subject_detected_points,
     database_faces
 ):
-    """以被试和其3张样本脸共同建立AFA/GPA参考形状并完成对齐。"""
+    """以被试和该系列样本脸共同建立AFA/GPA参考形状并完成对齐。"""
     images = [subject_image] + [entry[0] for entry in database_faces]
     landmark_sets = [
         np.asarray(subject_detected_points[:68], dtype=np.float32)
@@ -1273,7 +1273,7 @@ def build_morph_stimulus(job):
         )
 
     final_face = crop_face_tight(morphed_full, avg_points)
-    generated_image = save_generated_face(
+    save_generated_face(
         final_face,
         job["participant_id"],
         job["trial_id"],
@@ -1284,13 +1284,17 @@ def build_morph_stimulus(job):
     result = {
         "id": f"stim_{job['trial_id']}",
         "url": cv2_to_base64(final_face),
-        "type": job["stimulus_type"],
-        "description": job["description"],
-        "source_upload": job["source_upload"],
-        "source_db": job["source_db"],
-        "generated_image": generated_image
+        "series_source": job["series_source"],
+        "face_role": (
+            "original" if ratio >= 1.0 - 1e-6
+            else "base_face" if ratio <= 1e-6
+            else "blend"
+        ),
+        "ratio_level": ratio,
+        "source_db_image": (
+            None if ratio >= 1.0 - 1e-6 else job["source_db"]
+        )
     }
-    result[job["ratio_key"]] = ratio
     return result
 
 
@@ -1398,13 +1402,13 @@ def prepare_merge_groups(payload):
 
     trial_id = 1
     ratios = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    morph_jobs = []
+    morph_groups = []
 
-    # 本人和伴侣各自固定使用 3 个同性数据库面孔；同一面孔覆盖全部 6 个比例。
-    # 双方性别相同时，伴侣组排除本人组已经选中的数据库身份。
+    # 本人使用 2 个、伴侣使用 4 个同性数据库面孔。双方性别相同时，
+    # 伴侣组排除本人组已经选中的数据库身份，确保六个身份互不重叠。
     preprocessed_entries = load_preprocessed_database_manifest()
     self_db_faces = get_random_original_db_images(
-        self_gender, count=3, preprocessed_entries=preprocessed_entries
+        self_gender, count=2, preprocessed_entries=preprocessed_entries
     )
     partner_excluded_filenames = (
         {db_filename for _, db_filename, _ in self_db_faces}
@@ -1413,17 +1417,17 @@ def prepare_merge_groups(payload):
     )
     partner_db_faces = get_random_original_db_images(
         partner_gender,
-        count=3,
+        count=4,
         excluded_filenames=partner_excluded_filenames,
         preprocessed_entries=preprocessed_entries
     )
-    if len(self_db_faces) < 3 or len(partner_db_faces) < 3:
+    if len(self_db_faces) < 2 or len(partner_db_faces) < 4:
         raise RuntimeError(
-            "At least three valid same-gender database faces are required "
-            "for each photograph."
+            "At least two valid database faces are required for the self series "
+            "and four for the partner series."
         )
 
-    # 本人与伴侣分别用“上传脸 + 3张数据库脸”建立一次AFA共识形状。
+    # 本人与伴侣分别用“上传脸 + 对应数据库脸”建立一次AFA共识形状。
     (
         (img_self_aligned, self_points),
         self_db_faces
@@ -1445,8 +1449,11 @@ def prepare_merge_groups(payload):
         self_db_faces,
         start=1
     ):
-        for ratio in ratios:
-            morph_jobs.append({
+        group = []
+        # 100% 本人端点只生成一次，其余数据库身份生成 0%--80%。
+        group_ratios = ratios if db_index == 1 else ratios[:-1]
+        for ratio in group_ratios:
+            group.append({
                 "trial_id": trial_id,
                 "participant_id": participant_id,
                 "subject_image": img_self_aligned,
@@ -1454,20 +1461,22 @@ def prepare_merge_groups(payload):
                 "database_image": db_img,
                 "database_points": db_points,
                 "ratio": ratio,
-                "ratio_key": "ratio_self",
                 "stimulus_type": "self_morph",
-                "description": f"Self Morph {int(ratio*100)}% / Face {db_index}",
-                "source_upload": self_filename,
+                "series_source": "self",
                 "source_db": db_filename
             })
             trial_id += 1
+        morph_groups.append(group)
 
     for db_index, (db_img, db_filename, db_points) in enumerate(
         partner_db_faces,
         start=1
     ):
-        for ratio in ratios:
-            morph_jobs.append({
+        group = []
+        # 100% 伴侣端点只生成一次，其余数据库身份生成 0%--80%。
+        group_ratios = ratios if db_index == 1 else ratios[:-1]
+        for ratio in group_ratios:
+            group.append({
                 "trial_id": trial_id,
                 "participant_id": participant_id,
                 "subject_image": img_partner_aligned,
@@ -1475,15 +1484,14 @@ def prepare_merge_groups(payload):
                 "database_image": db_img,
                 "database_points": db_points,
                 "ratio": ratio,
-                "ratio_key": "ratio_partner",
                 "stimulus_type": "partner_morph",
-                "description": f"Partner Morph {int(ratio*100)}% / Face {db_index}",
-                "source_upload": partner_filename,
+                "series_source": "partner",
                 "source_db": db_filename
             })
             trial_id += 1
+        morph_groups.append(group)
 
-    return photo_batch_id, [morph_jobs[i:i + 6] for i in range(0, 36, 6)]
+    return photo_batch_id, morph_groups
 
 
 class MergePreparationError(Exception):
@@ -1519,7 +1527,7 @@ def prepare_merge_worker(payload, work_dir):
 
 
 def morph_group_worker(work_dir, index):
-    """独立 CPU 进程：一次只计算一个数据库身份的六个融合比例。"""
+    """独立 CPU 进程：一次只计算一个数据库身份的全部所需融合比例。"""
     try:
         with open(os.path.join(work_dir, f'group_{index}.pkl'), 'rb') as source:
             group = pickle.load(source)
@@ -1534,12 +1542,21 @@ def morph_group_worker(work_dir, index):
 def finalize_merge_result(participant_id, photo_batch_id, result_images):
     """全部子进程退出后才确认结果、释放计算名额。"""
 
-    self_images = [image for image in result_images if image.get("type") == "self_morph"]
-    partner_images = [image for image in result_images if image.get("type") == "partner_morph"]
+    self_images = [image for image in result_images if image.get("series_source") == "self"]
+    partner_images = [image for image in result_images if image.get("series_source") == "partner"]
+    endpoint_images = [
+        image for image in result_images
+        if image.get("face_role") in ("base_face", "original")
+    ]
     if (
-        len(result_images) != 36
-        or len(self_images) != 18
-        or len(partner_images) != 18
+        len(result_images) != 32
+        or len(self_images) != 11
+        or len(partner_images) != 21
+        or len(endpoint_images) != 8
+        or sum(image.get("face_role") == "original" for image in self_images) != 1
+        or sum(image.get("face_role") == "original" for image in partner_images) != 1
+        or sum(image.get("face_role") == "base_face" for image in self_images) != 2
+        or sum(image.get("face_role") == "base_face" for image in partner_images) != 4
         or any(
             not isinstance(image.get("url"), str)
             or not image["url"].startswith("data:image/jpeg;base64,")
@@ -1547,14 +1564,20 @@ def finalize_merge_result(participant_id, photo_batch_id, result_images):
             for image in result_images
         )
     ):
-        raise RuntimeError("Face processing did not produce all 36 valid images.")
+        raise RuntimeError("Face processing did not produce the required 32 main and 8 endpoint images.")
 
+    source_evaluation_images = [
+        {**image, "id": f"final_{image['id']}"}
+        for image in endpoint_images
+    ]
     random.shuffle(result_images)
+    random.shuffle(source_evaluation_images)
     return {
         "status": "completed",
         "participant_id": participant_id,
         "photo_batch_id": photo_batch_id,
-        "images": result_images
+        "images": result_images,
+        "source_evaluation_images": source_evaluation_images
     }
 
 
