@@ -2259,6 +2259,12 @@ def save_data():
             save_revision = 0
         data['save_revision'] = save_revision
         is_complete = data.get('is_complete', False)
+
+        # 只有明确确认已获得伴侣照片同意的完整记录才可以进入 SONA 赋分流程。
+        if is_complete and data.get('partner_consent_obtained') is not True:
+            return jsonify({
+                'error': 'Partner consent confirmation is required.'
+            }), 403
         
         # 一次实验只用一个JSON文件；最终保存先落盘，SONA 在后台确认。
         json_filename = _build_experiment_json_file_info(data, is_complete)
