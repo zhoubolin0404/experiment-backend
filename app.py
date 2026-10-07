@@ -97,7 +97,7 @@ SONA_COMPLETION_API_URL = os.environ.get(
     'SONA_COMPLETION_API_URL',
     'https://bristolpsych.sona-systems.com/services/SonaAPI.svc/WebstudyCredit'
 )
-SONA_EXPERIMENT_ID = os.environ.get('SONA_EXPERIMENT_ID', '2514')
+SONA_EXPERIMENT_ID = os.environ.get('SONA_EXPERIMENT_ID', '2520')
 # 安全起见，credit token 只能由后端环境变量提供，不能提交到公开仓库。
 SONA_CREDIT_TOKEN = os.environ.get('SONA_CREDIT_TOKEN', '').strip()
 SONA_REQUEST_TIMEOUT_SECONDS = 15
