@@ -1360,10 +1360,7 @@ def prepare_merge_groups(payload):
         raise MergePreparationError(
             'A clear face could not be detected in ' + ' and '.join(invalid_roles)
             + '. Please use a clear, front-facing photograph with a neutral '
-              'expression. Keep hair, including a fringe or bangs, away from '
-              'the eyes and other key facial features as much as possible. '
-              'Remove glasses, sunglasses, and face coverings, and use soft, '
-              'even lighting without strong shadows, glare, or overexposure.',
+              'expression and no glasses, sunglasses, or face coverings.',
             'FACE_QUALITY_ERROR', 422
         )
 
@@ -1392,11 +1389,7 @@ def prepare_merge_groups(payload):
             'The photo requirements were not met for '
             + ' and '.join(affected_roles)
             + '. Please use a clear, front-facing photograph with a neutral '
-              'expression and a clean, uncluttered background. Keep hair, '
-              'including a fringe or bangs, away from the eyes and other key '
-              'facial features as much as possible. Remove glasses, sunglasses, '
-              'and face coverings, and use soft, even lighting without strong '
-              'shadows, glare, or overexposure.',
+              'expression and no glasses, sunglasses, or face coverings.',
             'FACE_OCCLUSION_ERROR', 422, issues=occlusion_issues
         )
 
